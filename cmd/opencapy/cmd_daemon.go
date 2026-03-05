@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/richardyc/opencapy/internal/config"
+	"github.com/richardyc/opencapy/internal/fsevent"
 	"github.com/richardyc/opencapy/internal/platform"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/tmux"
@@ -74,6 +75,36 @@ func newDaemonCmd() *cobra.Command {
 
 			// Start WebSocket server
 			srv := ws.New(cfg.Port, w.Events(), reg)
+
+			// Start file watcher
+			fw, fwErr := fsevent.New()
+			if fwErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not start file watcher: %v\n", fwErr)
+			} else {
+				// Add all known project paths
+				var projectPaths []string
+				if reg != nil {
+					projectPaths = reg.AllProjects()
+				}
+				for _, projectPath := range projectPaths {
+					if err := fw.AddProject(projectPath); err != nil {
+						fmt.Fprintf(os.Stderr, "warning: could not watch project %s: %v\n", projectPath, err)
+					}
+				}
+				go fw.Start(ctx)
+
+				// Forward file events to WebSocket clients
+				go func() {
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						case ev := <-fw.Events():
+							srv.BroadcastFileEvent(ev)
+						}
+					}
+				}()
+			}
 
 			fmt.Printf("OpenCapy daemon starting on :%d\n", cfg.Port)
 			fmt.Printf("Host: %s\n", platform.Hostname())

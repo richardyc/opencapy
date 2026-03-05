@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/richardyc/opencapy/internal/fsevent"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/richardyc/opencapy/internal/watcher"
@@ -300,6 +301,29 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 	}
 
 	return snapshots
+}
+
+// BroadcastFileEvent marshals a FileEvent and broadcasts it to all connected clients.
+func (s *Server) BroadcastFileEvent(ev fsevent.FileEvent) {
+	msg := OutboundMessage{
+		Type:    "file_event",
+		Payload: ev,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("BroadcastFileEvent marshal: %v", err)
+		return
+	}
+
+	s.mu.RLock()
+	for _, client := range s.clients {
+		select {
+		case client.send <- data:
+		default:
+			// Client too slow, skip
+		}
+	}
+	s.mu.RUnlock()
 }
 
 // ClientCount returns the number of connected clients.

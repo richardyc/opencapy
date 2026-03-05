@@ -78,6 +78,21 @@ func (r *Registry) All() map[string]string {
 	return out
 }
 
+// AllProjects returns a deduplicated list of all project paths in the registry.
+func (r *Registry) AllProjects() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]bool)
+	var out []string
+	for _, path := range r.sessions {
+		if !seen[path] {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
 // Save writes the registry to disk.
 func (r *Registry) Save() error {
 	r.mu.RLock()
