@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/richardyc/opencapy/internal/fsevent"
 	"github.com/richardyc/opencapy/internal/platform"
 	"github.com/richardyc/opencapy/internal/project"
+	"github.com/richardyc/opencapy/internal/push"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/richardyc/opencapy/internal/watcher"
 	"github.com/richardyc/opencapy/internal/ws"
@@ -73,8 +75,14 @@ func newDaemonCmd() *cobra.Command {
 
 			go w.Start(ctx)
 
+			// Load push registry
+			pushReg, pushErr := push.Load(filepath.Join(os.Getenv("HOME"), ".opencapy"))
+			if pushErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not load push registry: %v\n", pushErr)
+			}
+
 			// Start WebSocket server
-			srv := ws.New(cfg.Port, w.Events(), reg)
+			srv := ws.New(cfg.Port, w.Events(), reg, pushReg)
 
 			// Start file watcher
 			fw, fwErr := fsevent.New()

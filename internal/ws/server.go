@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/richardyc/opencapy/internal/fsevent"
 	"github.com/richardyc/opencapy/internal/project"
+	"github.com/richardyc/opencapy/internal/push"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/richardyc/opencapy/internal/watcher"
 )
@@ -26,9 +27,10 @@ type OutboundMessage struct {
 
 // InboundMessage is received from iOS clients.
 type InboundMessage struct {
-	Type    string `json:"type"`              // "ping", "approve", "deny", "send_keys"
+	Type    string `json:"type"`              // "ping", "approve", "deny", "send_keys", "register_push"
 	Session string `json:"session"`
 	Keys    string `json:"keys,omitempty"`
+	Token   string `json:"token,omitempty"`
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -52,16 +54,18 @@ type Server struct {
 	clients  map[string]*Client
 	events   <-chan watcher.Event
 	registry *project.Registry
+	push     *push.Registry
 	mu       sync.RWMutex
 }
 
 // New creates a new WebSocket server.
-func New(port int, events <-chan watcher.Event, reg *project.Registry) *Server {
+func New(port int, events <-chan watcher.Event, reg *project.Registry, pushReg *push.Registry) *Server {
 	return &Server{
 		port:     port,
 		clients:  make(map[string]*Client),
 		events:   events,
 		registry: reg,
+		push:     pushReg,
 	}
 }
 
@@ -232,6 +236,12 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Session != "" && msg.Keys != "" {
 			_ = tmux.SendKeys(msg.Session, msg.Keys)
 		}
+
+	case "register_push":
+		if msg.Token != "" && s.push != nil {
+			_ = s.push.Register(msg.Token, client.ID)
+			log.Printf("Device registered for push: %s", client.ID)
+		}
 	}
 }
 
@@ -255,6 +265,7 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 			}
 
 			s.mu.RLock()
+			clientCount := len(s.clients)
 			for _, client := range s.clients {
 				select {
 				case client.send <- data:
@@ -263,6 +274,29 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 				}
 			}
 			s.mu.RUnlock()
+
+			// Push notifications when no iOS clients are connected.
+			if s.push != nil && clientCount == 0 {
+				switch ev.Type {
+				case watcher.EventApproval:
+					s.push.Send(push.Payload{
+						Aps: push.ApsPayload{
+							Alert: push.AlertPayload{
+								Title: "Approval needed",
+								Body:  fmt.Sprintf("[%s] Claude Code needs your input", ev.Session),
+							},
+							Sound:    "default",
+							Category: "APPROVAL",
+						},
+						Session: ev.Session,
+						Event:   string(ev.Type),
+					})
+				case watcher.EventCrash:
+					s.push.Send(push.CrashPayload(ev.Session, ev.Content))
+				case watcher.EventDone:
+					s.push.Send(push.DonePayload(ev.Session))
+				}
+			}
 		}
 	}
 }
