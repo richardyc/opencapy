@@ -15,7 +15,11 @@ type Config struct {
 }
 
 func configPath() string {
-	home, _ := os.UserHomeDir()
+	// Prefer HOME env var (allows test overrides), fall back to UserHomeDir
+	home := os.Getenv("HOME")
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
 	return filepath.Join(home, ".opencapy", "config.json")
 }
 
@@ -32,6 +36,9 @@ func Load() (*Config, error) {
 	data, err := os.ReadFile(p)
 	if err == nil {
 		_ = json.Unmarshal(data, cfg)
+	} else if os.IsNotExist(err) {
+		// First run — persist defaults
+		_ = cfg.Save()
 	}
 
 	// Env override

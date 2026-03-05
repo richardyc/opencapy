@@ -1,9 +1,16 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
+)
+
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 func main() {
@@ -25,6 +32,13 @@ func main() {
 		newDaemonCmd(),
 		newQRCmd(),
 		newInstallCmd(),
+		&cobra.Command{
+			Use:   "version",
+			Short: "Print version info",
+			Run: func(cmd *cobra.Command, args []string) {
+				fmt.Printf("opencapy %s (commit %s, built %s)\n", version, commit, date)
+			},
+		},
 	)
 
 	if err := rootCmd.Execute(); err != nil {

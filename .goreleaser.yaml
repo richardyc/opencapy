@@ -1,0 +1,59 @@
+version: 2
+
+project_name: opencapy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: opencapy
+    binary: opencapy
+    main: ./cmd/opencapy
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "opencapy_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  github:
+    owner: richardyc
+    name: opencapy
+  draft: false
+  prerelease: auto
+
+brews:
+  - name: opencapy
+    repository:
+      owner: richardyc
+      name: opencapy
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    commit_author:
+      name: opencapy-bot
+      email: bot@opencapy.dev
+    directory: Formula
+    homepage: "https://opencapy.dev"
+    description: "Your machines, mirrored. Code from anywhere."
+    license: "MIT"
+    skip_upload: false
+    install: |
+      bin.install "opencapy"
+    test: |
+      system "#{bin}/opencapy", "--help"
