@@ -1,11 +1,14 @@
 package platform
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"text/template"
 )
 
@@ -26,6 +29,32 @@ func Hostname() string {
 		return "unknown"
 	}
 	return h
+}
+
+// tailscaleStatus is a minimal struct for parsing tailscale status --json output.
+type tailscaleStatus struct {
+	Self struct {
+		DNSName string `json:"DNSName"`
+	} `json:"Self"`
+}
+
+// TailscaleHostname returns the Tailscale MagicDNS hostname (trimmed trailing dot)
+// and true if Tailscale is running. Falls back to Hostname() with a warning if not.
+func TailscaleHostname() (string, bool) {
+	out, err := exec.Command("tailscale", "status", "--json").Output()
+	if err != nil {
+		log.Printf("Tailscale not available (%v) — falling back to system hostname", err)
+		return Hostname(), false
+	}
+
+	var status tailscaleStatus
+	if err := json.Unmarshal(out, &status); err != nil || status.Self.DNSName == "" {
+		log.Printf("Tailscale status parse error (%v) — falling back to system hostname", err)
+		return Hostname(), false
+	}
+
+	hostname := strings.TrimSuffix(status.Self.DNSName, ".")
+	return hostname, true
 }
 
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>

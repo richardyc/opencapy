@@ -7,11 +7,21 @@ import (
 	"strconv"
 )
 
+// APNsConfig holds Apple Push Notification service configuration.
+type APNsConfig struct {
+	KeyPath    string `json:"key_path"`   // path to .p8 private key file
+	KeyID      string `json:"key_id"`     // 10-char key ID from Apple Developer portal
+	TeamID     string `json:"team_id"`    // 10-char team ID from Apple Developer portal
+	BundleID   string `json:"bundle_id"`  // default: "dev.opencapy.app"
+	Production bool   `json:"production"` // false = sandbox/dev, true = production
+}
+
 // Config holds daemon configuration.
 type Config struct {
-	Port         int    `json:"port"`          // default 7242
-	PollInterval int    `json:"poll_interval"` // ms, default 500
-	LogPath      string `json:"log_path"`
+	Port         int        `json:"port"`          // default 7242
+	PollInterval int        `json:"poll_interval"` // ms, default 500
+	LogPath      string     `json:"log_path"`
+	APNs         APNsConfig `json:"apns"`
 }
 
 func configPath() string {

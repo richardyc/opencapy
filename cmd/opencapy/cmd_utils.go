@@ -59,7 +59,13 @@ func newQRCmd() *cobra.Command {
 				return fmt.Errorf("load config: %w", err)
 			}
 
-			hostname := platform.Hostname()
+			hostname, isTailscale := platform.TailscaleHostname()
+			if isTailscale {
+				fmt.Printf("Tailscale address detected: %s\n", hostname)
+			} else {
+				fmt.Printf("Tailscale not running — using hostname: %s (install Tailscale for best connectivity)\n", hostname)
+			}
+
 			url := fmt.Sprintf("opencapy://%s:%d", hostname, cfg.Port)
 
 			fmt.Println("Connect your iOS device to this machine:")
