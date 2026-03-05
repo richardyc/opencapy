@@ -39,7 +39,7 @@ release:
   draft: false
   prerelease: auto
 
-brews:
+homebrew:
   - name: opencapy
     repository:
       owner: richardyc
@@ -52,7 +52,6 @@ brews:
     homepage: "https://opencapy.dev"
     description: "Your machines, mirrored. Code from anywhere."
     license: "MIT"
-    skip_upload: false
     install: |
       bin.install "opencapy"
     test: |
