@@ -7,6 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/sideshow/apns2"
+	"github.com/sideshow/apns2/token"
+	"github.com/richardyc/opencapy/internal/config"
 )
 
 // DeviceToken represents a registered iOS device for push notifications.
@@ -17,9 +21,11 @@ type DeviceToken struct {
 
 // Registry holds registered device tokens, persisted to ~/.opencapy/devices.json
 type Registry struct {
-	mu      sync.RWMutex
-	devices map[string]DeviceToken // token -> DeviceToken
-	path    string
+	mu         sync.RWMutex
+	devices    map[string]DeviceToken // token -> DeviceToken
+	path       string
+	apnsClient *apns2.Client // nil if APNs not configured
+	bundleID   string
 }
 
 // Payload is the APNs push notification payload.
@@ -105,10 +111,76 @@ func (r *Registry) save() error {
 	return os.WriteFile(r.path, data, 0o600)
 }
 
-// Send logs the push payload (stub — real APNs delivery wired in v0.6).
+// InitAPNs loads the .p8 key and initialises the APNs client.
+// If the key file is missing or config is empty, it logs a note and falls back to stub.
+func (r *Registry) InitAPNs(cfg config.APNsConfig) error {
+	if cfg.KeyPath == "" || cfg.KeyID == "" || cfg.TeamID == "" {
+		log.Println("[push] APNs config incomplete — running in stub mode")
+		return nil
+	}
+
+	authKey, err := token.AuthKeyFromFile(cfg.KeyPath)
+	if err != nil {
+		log.Printf("[push] APNs key load failed (%v) — running in stub mode", err)
+		return nil // graceful fallback, not an error
+	}
+
+	t := &token.Token{
+		AuthKey: authKey,
+		KeyID:   cfg.KeyID,
+		TeamID:  cfg.TeamID,
+	}
+
+	client := apns2.NewTokenClient(t)
+	if cfg.Production {
+		client = client.Production()
+	} else {
+		client = client.Development()
+	}
+
+	bundleID := cfg.BundleID
+	if bundleID == "" {
+		bundleID = "dev.opencapy.app"
+	}
+
+	r.mu.Lock()
+	r.apnsClient = client
+	r.bundleID = bundleID
+	r.mu.Unlock()
+
+	log.Printf("[push] APNs initialised (bundleID=%s, production=%v)", bundleID, cfg.Production)
+	return nil
+}
+
+// Send delivers push notifications. Uses real APNs when client is initialised and
+// devices are registered; falls back to stub logging otherwise.
 func (r *Registry) Send(payload Payload) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	if r.apnsClient != nil && len(r.devices) > 0 {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("[push] marshal payload: %v", err)
+			return
+		}
+		for _, dt := range r.devices {
+			n := &apns2.Notification{
+				DeviceToken: dt.Token,
+				Topic:       r.bundleID,
+				Payload:     data,
+			}
+			res, err := r.apnsClient.Push(n)
+			if err != nil {
+				log.Printf("[push] APNs send to %s: %v", dt.Token, err)
+			} else if res.StatusCode != 200 {
+				log.Printf("[push] APNs non-200 for %s: %d %s", dt.Token, res.StatusCode, res.Reason)
+			} else {
+				log.Printf("[push] APNs delivered to %s (apns-id=%s)", dt.Token, res.ApnsID)
+			}
+		}
+		return
+	}
 
 	data, _ := json.MarshalIndent(payload, "", "  ")
 	log.Printf("[push stub] would send to %d devices:\n%s", len(r.devices), string(data))

@@ -81,6 +81,13 @@ func newDaemonCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "warning: could not load push registry: %v\n", pushErr)
 			}
 
+			// Initialise APNs client (graceful fallback if not configured)
+			if pushReg != nil {
+				if err := pushReg.InitAPNs(cfg.APNs); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: APNs init: %v\n", err)
+				}
+			}
+
 			// Start WebSocket server
 			srv := ws.New(cfg.Port, w.Events(), reg, pushReg)
 
