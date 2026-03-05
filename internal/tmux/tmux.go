@@ -18,11 +18,20 @@ type Session struct {
 	Created time.Time
 }
 
-// NewSession creates a new detached tmux session.
+// CapybaraColor is the opencapy brand status-bar color — warm capybara brown.
+const CapybaraColor = "#7B5B3A"
+
+// NewSession creates a new detached tmux session with the opencapy capybara status bar.
 func NewSession(name, cwd string) error {
 	cmd := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", cwd)
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	// Set capybara brown status bar on this session only.
+	_ = exec.Command("tmux", "set-option", "-t", name,
+		"status-style", "bg="+CapybaraColor+",fg=#F5E6D3").Run()
+	return nil
 }
 
 // ListSessions returns all current tmux sessions.
