@@ -7,10 +7,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/richardyc/opencapy/internal/watcher"
 )
@@ -28,6 +30,14 @@ type InboundMessage struct {
 	Keys    string `json:"keys,omitempty"`
 }
 
+// SessionSnapshot holds a point-in-time snapshot of a session's state.
+type SessionSnapshot struct {
+	Name        string    `json:"name"`
+	ProjectPath string    `json:"project_path"`
+	LastOutput  string    `json:"last_output"` // last 20 lines of pane
+	Timestamp   time.Time `json:"timestamp"`
+}
+
 // Client represents a connected iOS device.
 type Client struct {
 	ID   string
@@ -37,18 +47,20 @@ type Client struct {
 
 // Server is the WebSocket server that bridges watcher events to iOS.
 type Server struct {
-	port    int
-	clients map[string]*Client
-	events  <-chan watcher.Event
-	mu      sync.RWMutex
+	port     int
+	clients  map[string]*Client
+	events   <-chan watcher.Event
+	registry *project.Registry
+	mu       sync.RWMutex
 }
 
 // New creates a new WebSocket server.
-func New(port int, events <-chan watcher.Event) *Server {
+func New(port int, events <-chan watcher.Event, reg *project.Registry) *Server {
 	return &Server{
-		port:    port,
-		clients: make(map[string]*Client),
-		events:  events,
+		port:     port,
+		clients:  make(map[string]*Client),
+		events:   events,
+		registry: reg,
 	}
 }
 
@@ -117,6 +129,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Send snapshot of current sessions to newly connected client
+	go func() {
+		snapshots := s.snapshotSessions()
+		msg := OutboundMessage{Type: "snapshot", Payload: snapshots}
+		data, err := json.Marshal(msg)
+		if err == nil {
+			select {
+			case client.send <- data:
+			default:
+			}
+		}
+	}()
+
 	// Writer goroutine
 	go func() {
 		defer conn.CloseNow()
@@ -129,6 +154,27 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if err := conn.Write(ctx, websocket.MessageText, msg); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	// Heartbeat goroutine: ping every 30s, close if no response within 5s
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err := conn.Ping(pingCtx)
+				cancel()
+				if err != nil {
+					// client dead — trigger cleanup
+					conn.CloseNow()
 					return
 				}
 			}
@@ -218,6 +264,42 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 			s.mu.RUnlock()
 		}
 	}
+}
+
+// snapshotSessions builds a snapshot of all currently-registered sessions.
+func (s *Server) snapshotSessions() []SessionSnapshot {
+	var snapshots []SessionSnapshot
+	now := time.Now()
+
+	sessions, err := tmux.ListSessions()
+	if err != nil {
+		return snapshots
+	}
+
+	for _, sess := range sessions {
+		projectPath := sess.Cwd
+		if s.registry != nil {
+			if p, ok := s.registry.GetProject(sess.Name); ok {
+				projectPath = p
+			}
+		}
+
+		output, _ := tmux.CapturePaneOutput(sess.Name, 20)
+		// Trim to last 20 lines just in case
+		lines := strings.Split(output, "\n")
+		if len(lines) > 20 {
+			lines = lines[len(lines)-20:]
+		}
+
+		snapshots = append(snapshots, SessionSnapshot{
+			Name:        sess.Name,
+			ProjectPath: projectPath,
+			LastOutput:  strings.Join(lines, "\n"),
+			Timestamp:   now,
+		})
+	}
+
+	return snapshots
 }
 
 // ClientCount returns the number of connected clients.

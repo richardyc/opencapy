@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"hash/fnv"
 	"regexp"
 	"sync"
 	"time"
@@ -58,18 +59,22 @@ func DetectEvents(sessionName, output string) []Event {
 
 // Watcher polls all registered sessions and emits events.
 type Watcher struct {
-	mu       sync.RWMutex
-	sessions map[string]string // name -> project path
-	events   chan Event
-	interval time.Duration
+	mu        sync.RWMutex
+	sessions  map[string]string              // name -> project path
+	events    chan Event
+	interval  time.Duration
+	lastHash  map[string]uint64              // session -> hash of last pane output
+	lastEvent map[string]map[EventType]time.Time // session -> event type -> last emit time
 }
 
 // New creates a new Watcher with the given poll interval.
 func New(interval time.Duration) *Watcher {
 	return &Watcher{
-		sessions: make(map[string]string),
-		events:   make(chan Event, 100),
-		interval: interval,
+		sessions:  make(map[string]string),
+		events:    make(chan Event, 100),
+		interval:  interval,
+		lastHash:  make(map[string]uint64),
+		lastEvent: make(map[string]map[EventType]time.Time),
 	}
 }
 
@@ -85,6 +90,8 @@ func (w *Watcher) RemoveSession(name string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.sessions, name)
+	delete(w.lastHash, name)
+	delete(w.lastEvent, name)
 }
 
 // Events returns the read-only event channel.
@@ -121,8 +128,33 @@ func (w *Watcher) poll() {
 			continue
 		}
 
+		// Compute content hash — skip if unchanged
+		h := fnv.New64a()
+		h.Write([]byte(output))
+		hash := h.Sum64()
+
+		w.mu.Lock()
+		if w.lastHash[name] == hash {
+			w.mu.Unlock()
+			continue // nothing changed
+		}
+		w.lastHash[name] = hash
+		w.mu.Unlock()
+
 		events := DetectEvents(name, output)
 		for _, ev := range events {
+			// 2-second cooldown per (session, event type)
+			w.mu.Lock()
+			if w.lastEvent[name] == nil {
+				w.lastEvent[name] = make(map[EventType]time.Time)
+			}
+			if last, ok := w.lastEvent[name][ev.Type]; ok && time.Since(last) < 2*time.Second {
+				w.mu.Unlock()
+				continue
+			}
+			w.lastEvent[name][ev.Type] = time.Now()
+			w.mu.Unlock()
+
 			select {
 			case w.events <- ev:
 			default:
