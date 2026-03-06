@@ -2,16 +2,51 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"time"
 
+	"github.com/richardyc/opencapy/internal/config"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/richardyc/opencapy/internal/watcher"
 	"github.com/spf13/cobra"
 )
 
+// ensureDaemon checks if the daemon is running and starts it in the background if not.
+func ensureDaemon() {
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	addr := "127.0.0.1:" + strconv.Itoa(cfg.Port)
+	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return // already running
+	}
+	// Not running — launch in background.
+	self, err := os.Executable()
+	if err != nil {
+		self = "opencapy"
+	}
+	proc := exec.Command(self, "daemon")
+	proc.Stdout = nil
+	proc.Stderr = nil
+	if err := proc.Start(); err == nil {
+		fmt.Println("→ daemon started in background (port", cfg.Port, ")")
+		// Brief pause so daemon is ready before we attach.
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func runRoot(cmd *cobra.Command, args []string) error {
+	// Auto-start daemon if not already running.
+	ensureDaemon()
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("get working directory: %w", err)
