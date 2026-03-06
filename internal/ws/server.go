@@ -301,6 +301,24 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 	}
 }
 
+// BroadcastSnapshot sends a fresh snapshot to all connected clients.
+func (s *Server) BroadcastSnapshot() {
+	snapshots := s.snapshotSessions()
+	msg := OutboundMessage{Type: "snapshot", Payload: snapshots}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.clients {
+		select {
+		case c.send <- data:
+		default:
+		}
+	}
+}
+
 // snapshotSessions builds a snapshot of all currently-registered sessions.
 func (s *Server) snapshotSessions() []SessionSnapshot {
 	var snapshots []SessionSnapshot
