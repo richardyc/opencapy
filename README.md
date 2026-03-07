@@ -1,5 +1,9 @@
 # OpenCapy
 
+<!-- TODO: migrate Homebrew formula to a separate tap repo (e.g. richardyc/homebrew-opencapy).
+     GoReleaser should push Formula/opencapy.rb there instead of this repo, so branch
+     protection on main here stays strict (PRs required). See .goreleaser.yaml brews.repository. -->
+
 **Your machines, mirrored. Code from anywhere.**
 
 OpenCapy is a lightweight daemon + iOS app that lets you monitor and control Claude Code sessions from your iPhone. Claude Code runs on your Mac or Linux VM. You watch it, approve prompts, browse changed files, and drop into a terminal — all from your phone.
