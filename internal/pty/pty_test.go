@@ -23,7 +23,7 @@ func TestPTYManager_OpenClose(t *testing.T) {
 	}
 	defer exec.Command("tmux", "kill-session", "-t", sessionName).Run() //nolint:errcheck
 
-	if err := mgr.Open(sessionName, 80, 24); err != nil {
+	if err := mgr.Open(sessionName, "test-client-1", 80, 24); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 

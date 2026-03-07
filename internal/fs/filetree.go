@@ -3,6 +3,7 @@ package fs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // TreeNode represents a file or directory in the tree.
@@ -15,14 +16,27 @@ type TreeNode struct {
 
 // skipDirs contains directory names that should never be descended into.
 var skipDirs = map[string]bool{
-	".git":          true,
-	"node_modules":  true,
-	".build":        true,
-	"__pycache__":   true,
+	".git":         true,
+	"node_modules": true,
+	".build":       true,
+	"__pycache__":  true,
 }
 
-// BuildTree walks root up to maxDepth levels deep and returns the tree.
-// Depth 0 = root node only, depth 1 = root + immediate children, etc.
+// skipFiles contains exact file names that should never be exposed.
+var skipFiles = map[string]bool{
+	"id_rsa": true,
+}
+
+// hasSensitiveSuffix reports whether a filename ends with a sensitive extension.
+func hasSensitiveSuffix(name string) bool {
+	lower := strings.ToLower(name)
+	return strings.HasSuffix(lower, ".pem") || strings.HasSuffix(lower, ".key")
+}
+
+// BuildTree walks root up to maxDepth directory levels deep and returns the tree.
+// maxDepth=3 means the root plus 2 more directory levels are visible
+// (root → level-1 → level-2). Directories at level-2 are returned as nodes
+// but their children are not expanded.
 func BuildTree(root string, maxDepth int) (TreeNode, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -31,6 +45,10 @@ func BuildTree(root string, maxDepth int) (TreeNode, error) {
 	return buildNode(abs, 0, maxDepth)
 }
 
+// buildNode builds a TreeNode at the given path.
+// depth is the current recursion depth (root = 0).
+// A directory at depth d will only have its children expanded when d+1 < maxDepth,
+// so directories at depth maxDepth-1 are leaves (no children populated).
 func buildNode(path string, depth, maxDepth int) (TreeNode, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -43,8 +61,9 @@ func buildNode(path string, depth, maxDepth int) (TreeNode, error) {
 		IsDir: info.IsDir(),
 	}
 
-	// Stop descending when we're already at depth maxDepth-1 so that
-	// entries at depth maxDepth are never added to the tree.
+	// Do not descend further once we would exceed maxDepth.
+	// depth+1 >= maxDepth means we are at the last visible level; listing
+	// children here would add entries at depth maxDepth which is beyond the limit.
 	if !info.IsDir() || depth+1 >= maxDepth {
 		return node, nil
 	}
@@ -58,11 +77,18 @@ func buildNode(path string, depth, maxDepth int) (TreeNode, error) {
 	for _, entry := range entries {
 		name := entry.Name()
 
-		// Skip hidden entries and known large/irrelevant dirs
-		if name == "" {
+		// Skip all dotfiles and dotdirs (hidden entries incl. .git, .ssh, etc.)
+		if strings.HasPrefix(name, ".") {
 			continue
 		}
+
+		// Skip known large/irrelevant dirs
 		if entry.IsDir() && skipDirs[name] {
+			continue
+		}
+
+		// Skip sensitive files by exact name or extension
+		if !entry.IsDir() && (skipFiles[name] || hasSensitiveSuffix(name)) {
 			continue
 		}
 

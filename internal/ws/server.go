@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -130,11 +131,16 @@ func (s *Server) Start(ctx context.Context) error {
 
 // handleQR generates and serves a QR code PNG for pairing.
 func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	hostname := platform.Hostname()
 	tailscaleHost, _ := platform.TailscaleHostname()
 
 	qrContent := fmt.Sprintf(
-		"opencapy://pair?name=%s&host=%s&port=%d",
+		"opencapy://pair?name=%s&host=%s&port=%d&type=tailscale",
 		hostname, tailscaleHost, s.port,
 	)
 
@@ -151,6 +157,11 @@ func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
 
 // handlePair returns JSON pairing information.
 func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	hostname := platform.Hostname()
 	tailscaleHost, _ := platform.TailscaleHostname()
 
@@ -161,6 +172,24 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		"port": s.port,
 		"type": "tailscale",
 	})
+}
+
+// isPathAllowed checks whether path falls within one of the registered project paths.
+// This prevents path traversal attacks on file_read, file_write, and list_dir.
+func isPathAllowed(path string, reg *project.Registry) bool {
+	if reg == nil {
+		return false
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	for _, projectPath := range reg.AllProjects() {
+		if abs == projectPath || strings.HasPrefix(abs, projectPath+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +273,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		delete(s.clients, clientID)
 		s.mu.Unlock()
+
+		// Clean up all PTY sessions owned by this client
+		if s.ptyMgr != nil {
+			s.ptyMgr.CloseByClient(clientID)
+		}
+
 		close(client.send)
 		conn.CloseNow()
 		log.Printf("Client disconnected: %s", clientID)
@@ -309,7 +344,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if rows <= 0 {
 			rows = 24
 		}
-		if err := s.ptyMgr.Open(msg.Session, cols, rows); err != nil {
+		if err := s.ptyMgr.Open(msg.Session, client.ID, cols, rows); err != nil {
 			log.Printf("open_pty %q: %v", msg.Session, err)
 		}
 
@@ -344,6 +379,17 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Path == "" {
 			break
 		}
+		if !isPathAllowed(msg.Path, s.registry) {
+			data, _ := json.Marshal(OutboundMessage{
+				Type:    "error",
+				Payload: map[string]string{"message": "path not allowed"},
+			})
+			select {
+			case client.send <- data:
+			default:
+			}
+			break
+		}
 		tree, err := fs.BuildTree(msg.Path, 3)
 		if err != nil {
 			log.Printf("list_dir %q: %v", msg.Path, err)
@@ -358,6 +404,30 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	case "file_read":
 		if msg.Path == "" {
+			break
+		}
+		if !isPathAllowed(msg.Path, s.registry) {
+			data, _ := json.Marshal(OutboundMessage{
+				Type:    "error",
+				Payload: map[string]string{"message": "path not allowed"},
+			})
+			select {
+			case client.send <- data:
+			default:
+			}
+			break
+		}
+		// Guard: reject files larger than 1 MB
+		info, err := os.Stat(msg.Path)
+		if err != nil || info.Size() > 1<<20 {
+			data, _ := json.Marshal(OutboundMessage{
+				Type:    "error",
+				Payload: map[string]string{"message": "file too large or not found"},
+			})
+			select {
+			case client.send <- data:
+			default:
+			}
 			break
 		}
 		content, err := os.ReadFile(msg.Path)
@@ -381,6 +451,17 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	case "file_write":
 		if msg.Path == "" || msg.Content == "" {
+			break
+		}
+		if !isPathAllowed(msg.Path, s.registry) {
+			data, _ := json.Marshal(OutboundMessage{
+				Type:    "error",
+				Payload: map[string]string{"message": "path not allowed"},
+			})
+			select {
+			case client.send <- data:
+			default:
+			}
 			break
 		}
 		decoded, err := base64.StdEncoding.DecodeString(msg.Content)
@@ -482,8 +563,8 @@ func (s *Server) BroadcastSnapshot() {
 	}
 }
 
-// BroadcastPTYOutput sends pty_output to all connected clients.
-func (s *Server) BroadcastPTYOutput(out ptymanager.PTYOutput) {
+// SendPTYOutput sends pty_output only to the client that owns the PTY session.
+func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
 	msg := OutboundMessage{
 		Type: "pty_output",
 		Payload: map[string]interface{}{
@@ -496,12 +577,14 @@ func (s *Server) BroadcastPTYOutput(out ptymanager.PTYOutput) {
 		return
 	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, c := range s.clients {
-		select {
-		case c.send <- data:
-		default:
-		}
+	c, ok := s.clients[out.ClientID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	select {
+	case c.send <- data:
+	default:
 	}
 }
 

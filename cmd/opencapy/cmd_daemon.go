@@ -95,14 +95,14 @@ func newDaemonCmd() *cobra.Command {
 			// Start WebSocket server
 			srv := ws.New(cfg.Port, w.Events(), reg, pushReg, ptyMgr)
 
-			// Forward PTY output events to all WebSocket clients
+			// Forward PTY output events to the owning WebSocket client only
 			go func() {
 				for {
 					select {
 					case <-ctx.Done():
 						return
 					case out := <-ptyMgr.Events():
-						srv.BroadcastPTYOutput(out)
+						srv.SendPTYOutput(out)
 					}
 				}
 			}()

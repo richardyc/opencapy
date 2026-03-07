@@ -12,8 +12,9 @@ import (
 
 // PTYOutput is a chunk of data read from a PTY session.
 type PTYOutput struct {
-	Session string
-	Data    []byte
+	Session  string
+	ClientID string // which client opened this PTY
+	Data     []byte
 }
 
 // PTYSession holds a single active PTY session.
@@ -21,6 +22,7 @@ type PTYSession struct {
 	sessionName string
 	ptmx        *os.File
 	cmd         *exec.Cmd
+	clientID    string // who opened this PTY
 }
 
 // Manager manages active PTY sessions.
@@ -44,7 +46,8 @@ func (m *Manager) Events() <-chan PTYOutput {
 }
 
 // Open spawns `tmux attach-session -t <sessionName>` inside a PTY.
-func (m *Manager) Open(sessionName string, cols, rows int) error {
+// clientID identifies which WebSocket client owns this PTY session.
+func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -65,6 +68,7 @@ func (m *Manager) Open(sessionName string, cols, rows int) error {
 		sessionName: sessionName,
 		ptmx:        ptmx,
 		cmd:         cmd,
+		clientID:    clientID,
 	}
 	m.sessions[sessionName] = sess
 
@@ -77,7 +81,7 @@ func (m *Manager) Open(sessionName string, cols, rows int) error {
 				chunk := make([]byte, n)
 				copy(chunk, buf[:n])
 				select {
-				case m.events <- PTYOutput{Session: sessionName, Data: chunk}:
+				case m.events <- PTYOutput{Session: sessionName, ClientID: clientID, Data: chunk}:
 				default:
 					// drop if channel full
 				}
@@ -89,7 +93,9 @@ func (m *Manager) Open(sessionName string, cols, rows int) error {
 				break
 			}
 		}
-		// Clean up from map when the process exits
+		// Clean up on natural exit: reap the process and close the pty fd.
+		_ = sess.cmd.Wait()
+		_ = sess.ptmx.Close()
 		m.mu.Lock()
 		delete(m.sessions, sessionName)
 		m.mu.Unlock()
@@ -142,4 +148,30 @@ func (m *Manager) Close(sessionName string) {
 		sess.cmd.Process.Kill()
 	}
 	sess.cmd.Wait() //nolint:errcheck
+}
+
+// CloseByClient closes and removes all PTY sessions owned by the given clientID.
+// Called when the owning WebSocket client disconnects.
+func (m *Manager) CloseByClient(clientID string) {
+	m.mu.Lock()
+	var toClose []*PTYSession
+	var toDelete []string
+	for name, sess := range m.sessions {
+		if sess.clientID == clientID {
+			toClose = append(toClose, sess)
+			toDelete = append(toDelete, name)
+		}
+	}
+	for _, name := range toDelete {
+		delete(m.sessions, name)
+	}
+	m.mu.Unlock()
+
+	for _, sess := range toClose {
+		sess.ptmx.Close()
+		if sess.cmd.Process != nil {
+			sess.cmd.Process.Kill()
+		}
+		sess.cmd.Wait() //nolint:errcheck
+	}
 }
