@@ -31,6 +31,8 @@ func NewSession(name, cwd string) error {
 	// Set capybara brown status bar on this session only.
 	_ = exec.Command("tmux", "set-option", "-t", name,
 		"status-style", "bg="+CapybaraColor+",fg=#F5E6D3").Run()
+	// Enable mouse so trackpad scroll works without entering copy mode.
+	_ = exec.Command("tmux", "set-option", "-t", name, "mouse", "on").Run()
 	return nil
 }
 
