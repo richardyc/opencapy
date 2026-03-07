@@ -2,17 +2,24 @@ package ws
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
+	qrcode "github.com/skip2/go-qrcode"
+
 	"github.com/richardyc/opencapy/internal/fsevent"
+	fs "github.com/richardyc/opencapy/internal/fs"
+	"github.com/richardyc/opencapy/internal/platform"
+	ptymanager "github.com/richardyc/opencapy/internal/pty"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/push"
 	"github.com/richardyc/opencapy/internal/tmux"
@@ -27,10 +34,17 @@ type OutboundMessage struct {
 
 // InboundMessage is received from iOS clients.
 type InboundMessage struct {
-	Type    string `json:"type"`              // "ping", "approve", "deny", "send_keys", "register_push"
+	Type    string `json:"type"`              // "ping", "approve", "deny", "send_keys", "register_push", ...
 	Session string `json:"session"`
 	Keys    string `json:"keys,omitempty"`
 	Token   string `json:"token,omitempty"`
+	// PTY fields
+	Cols int    `json:"cols,omitempty"`
+	Rows int    `json:"rows,omitempty"`
+	Data string `json:"data,omitempty"` // base64 for pty_input; raw path for file_write
+	// File fields
+	Path    string `json:"path,omitempty"`
+	Content string `json:"content,omitempty"` // base64 for file_write
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -55,17 +69,19 @@ type Server struct {
 	events   <-chan watcher.Event
 	registry *project.Registry
 	push     *push.Registry
+	ptyMgr   *ptymanager.Manager
 	mu       sync.RWMutex
 }
 
 // New creates a new WebSocket server.
-func New(port int, events <-chan watcher.Event, reg *project.Registry, pushReg *push.Registry) *Server {
+func New(port int, events <-chan watcher.Event, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
 	return &Server{
 		port:     port,
 		clients:  make(map[string]*Client),
 		events:   events,
 		registry: reg,
 		push:     pushReg,
+		ptyMgr:   ptyMgr,
 	}
 }
 
@@ -83,6 +99,8 @@ func (s *Server) Start(ctx context.Context) error {
 			"clients": clientCount,
 		})
 	})
+	mux.HandleFunc("/qr", s.handleQR)
+	mux.HandleFunc("/pair", s.handlePair)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.port),
@@ -108,6 +126,41 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// handleQR generates and serves a QR code PNG for pairing.
+func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
+	hostname := platform.Hostname()
+	tailscaleHost, _ := platform.TailscaleHostname()
+
+	qrContent := fmt.Sprintf(
+		"opencapy://pair?name=%s&host=%s&port=%d",
+		hostname, tailscaleHost, s.port,
+	)
+
+	png, err := qrcode.Encode(qrContent, qrcode.Medium, 256)
+	if err != nil {
+		http.Error(w, "qr encode error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.WriteHeader(http.StatusOK)
+	w.Write(png) //nolint:errcheck
+}
+
+// handlePair returns JSON pairing information.
+func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
+	hostname := platform.Hostname()
+	tailscaleHost, _ := platform.TailscaleHostname()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"name": hostname,
+		"host": tailscaleHost,
+		"port": s.port,
+		"type": "tailscale",
+	})
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -242,6 +295,116 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			_ = s.push.Register(msg.Token, client.ID)
 			log.Printf("Device registered for push: %s", client.ID)
 		}
+
+	// ── PTY messages ──────────────────────────────────────────────────────────
+
+	case "open_pty":
+		if s.ptyMgr == nil || msg.Session == "" {
+			break
+		}
+		cols, rows := msg.Cols, msg.Rows
+		if cols <= 0 {
+			cols = 80
+		}
+		if rows <= 0 {
+			rows = 24
+		}
+		if err := s.ptyMgr.Open(msg.Session, cols, rows); err != nil {
+			log.Printf("open_pty %q: %v", msg.Session, err)
+		}
+
+	case "pty_input":
+		if s.ptyMgr == nil || msg.Session == "" || msg.Data == "" {
+			break
+		}
+		decoded, err := base64.StdEncoding.DecodeString(msg.Data)
+		if err != nil {
+			log.Printf("pty_input decode: %v", err)
+			break
+		}
+		if err := s.ptyMgr.Write(msg.Session, decoded); err != nil {
+			log.Printf("pty_input write %q: %v", msg.Session, err)
+		}
+
+	case "pty_resize":
+		if s.ptyMgr == nil || msg.Session == "" {
+			break
+		}
+		cols, rows := msg.Cols, msg.Rows
+		if cols <= 0 || rows <= 0 {
+			break
+		}
+		if err := s.ptyMgr.Resize(msg.Session, cols, rows); err != nil {
+			log.Printf("pty_resize %q: %v", msg.Session, err)
+		}
+
+	// ── File messages ─────────────────────────────────────────────────────────
+
+	case "list_dir":
+		if msg.Path == "" {
+			break
+		}
+		tree, err := fs.BuildTree(msg.Path, 3)
+		if err != nil {
+			log.Printf("list_dir %q: %v", msg.Path, err)
+			break
+		}
+		resp := OutboundMessage{Type: "file_tree", Payload: tree}
+		data, _ := json.Marshal(resp)
+		select {
+		case client.send <- data:
+		default:
+		}
+
+	case "file_read":
+		if msg.Path == "" {
+			break
+		}
+		content, err := os.ReadFile(msg.Path)
+		if err != nil {
+			log.Printf("file_read %q: %v", msg.Path, err)
+			break
+		}
+		resp := OutboundMessage{
+			Type: "file_content",
+			Payload: map[string]interface{}{
+				"path":    msg.Path,
+				"content": base64.StdEncoding.EncodeToString(content),
+				"size":    len(content),
+			},
+		}
+		data, _ := json.Marshal(resp)
+		select {
+		case client.send <- data:
+		default:
+		}
+
+	case "file_write":
+		if msg.Path == "" || msg.Content == "" {
+			break
+		}
+		decoded, err := base64.StdEncoding.DecodeString(msg.Content)
+		if err != nil {
+			log.Printf("file_write decode %q: %v", msg.Path, err)
+			break
+		}
+		writeErr := os.WriteFile(msg.Path, decoded, 0o644)
+		ok := writeErr == nil
+		if writeErr != nil {
+			log.Printf("file_write %q: %v", msg.Path, writeErr)
+		}
+		resp := OutboundMessage{
+			Type: "file_write_ack",
+			Payload: map[string]interface{}{
+				"path": msg.Path,
+				"ok":   ok,
+			},
+		}
+		data, _ := json.Marshal(resp)
+		select {
+		case client.send <- data:
+		default:
+		}
 	}
 }
 
@@ -305,6 +468,29 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 func (s *Server) BroadcastSnapshot() {
 	snapshots := s.snapshotSessions()
 	msg := OutboundMessage{Type: "snapshot", Payload: snapshots}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.clients {
+		select {
+		case c.send <- data:
+		default:
+		}
+	}
+}
+
+// BroadcastPTYOutput sends pty_output to all connected clients.
+func (s *Server) BroadcastPTYOutput(out ptymanager.PTYOutput) {
+	msg := OutboundMessage{
+		Type: "pty_output",
+		Payload: map[string]interface{}{
+			"session": out.Session,
+			"data":    base64.StdEncoding.EncodeToString(out.Data),
+		},
+	}
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
