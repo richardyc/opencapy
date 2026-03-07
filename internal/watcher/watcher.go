@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,12 +32,18 @@ type Event struct {
 }
 
 var patterns = map[EventType]*regexp.Regexp{
-	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|yes.*no|\[y/n\]|❯\s*1\.?\s*yes)`),
-	EventThinking: regexp.MustCompile(`(?i)(architecting\.\.\.|thinking\.\.\.|analyzing\.\.\.|✶)`),
-	EventFileEdit: regexp.MustCompile(`(?i)(edited?:\s*|created?:\s*|modified?:\s*)(.+)`),
-	EventIdle:     regexp.MustCompile(`(?m)^❯\s*$`),
-	EventCrash:    regexp.MustCompile(`(?i)(traceback|error:|panic:|fatal:|exception:)`),
-	EventDone:     regexp.MustCompile(`(?i)(task complete|all done|finished)`),
+	// Claude Code prompts approval with numbered options like "❯ 1. Yes" / "1 Yes"
+	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|\[y/n\]|❯\s*1\.?\s*yes|^\s*1\s+yes)`),
+	// Claude Code thinking spinner starts with ✶ or ⏺
+	EventThinking: regexp.MustCompile(`✶|⏺\s+\w`),
+	// Claude Code shows Edit/Write/Create tool calls with a leading ⏺
+	EventFileEdit: regexp.MustCompile(`⏺\s+(Edit|Write|Create)\(`),
+	// Idle: shell prompt alone on a line (zsh ❯ or bash $)
+	EventIdle: regexp.MustCompile(`(?m)^❯\s*$`),
+	// Crash: language-specific crash indicators at line start, not general "error:"
+	EventCrash: regexp.MustCompile(`(?im)^\s*(Traceback \(most recent call last\)|panic:|fatal error:|FATAL ERROR:)`),
+	// Done: Claude Code's specific completion phrase
+	EventDone: regexp.MustCompile(`(?i)(task complete|claude code (is done|has finished|finished the task))`),
 }
 
 // DetectEvents scans pane output and returns matched events.
@@ -131,6 +138,9 @@ func (w *Watcher) poll() {
 	w.mu.RUnlock()
 
 	for _, name := range names {
+		// Capture 20 lines for hash (change detection), but only run pattern
+		// matching against the last 5 lines so we detect the *current* pane
+		// state and not historical output (e.g., code diffs shown by Claude Code).
 		output, err := tmux.CapturePaneOutput(name, 20)
 		if err != nil {
 			continue
@@ -149,7 +159,14 @@ func (w *Watcher) poll() {
 		w.lastHash[name] = hash
 		w.mu.Unlock()
 
-		events := DetectEvents(name, output)
+		// Only analyse the bottom 5 lines for current state detection.
+		lines := strings.Split(output, "\n")
+		if len(lines) > 5 {
+			lines = lines[len(lines)-5:]
+		}
+		tail := strings.Join(lines, "\n")
+
+		events := DetectEvents(name, tail)
 		for _, ev := range events {
 			// 2-second cooldown per (session, event type)
 			w.mu.Lock()

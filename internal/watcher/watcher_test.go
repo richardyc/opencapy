@@ -35,7 +35,8 @@ func TestDetectEvents_NoMatch(t *testing.T) {
 }
 
 func TestDetectEvents_FileEdit(t *testing.T) {
-	events := DetectEvents("test", "Edited: src/train.py")
+	// Claude Code emits tool calls with a leading ⏺ symbol
+	events := DetectEvents("test", "⏺ Edit(src/train.py)")
 	found := false
 	for _, e := range events {
 		if e.Type == EventFileEdit {

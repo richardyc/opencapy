@@ -333,10 +333,17 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	// ── PTY messages ──────────────────────────────────────────────────────────
 
+	case "close_pty":
+		if s.ptyMgr != nil && msg.Session != "" {
+			s.ptyMgr.Close(msg.Session)
+		}
+
 	case "open_pty":
 		if s.ptyMgr == nil || msg.Session == "" {
 			break
 		}
+		// Close any stale PTY for this session before reopening (handles reconnect/reopen)
+		s.ptyMgr.Close(msg.Session)
 		cols, rows := msg.Cols, msg.Rows
 		if cols <= 0 {
 			cols = 80
