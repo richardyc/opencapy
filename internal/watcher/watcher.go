@@ -21,6 +21,7 @@ const (
 	EventIdle     EventType = "idle"
 	EventCrash    EventType = "crash"
 	EventDone     EventType = "done"
+	EventInput    EventType = "input"
 )
 
 // Event represents a detected CC event in a tmux pane.
@@ -44,6 +45,14 @@ var patterns = map[EventType]*regexp.Regexp{
 	EventCrash: regexp.MustCompile(`(?im)^\s*(Traceback \(most recent call last\)|panic:|fatal error:|FATAL ERROR:)`),
 	// Done: Claude Code's specific completion phrase
 	EventDone: regexp.MustCompile(`(?i)(task complete|claude code (is done|has finished|finished the task))`),
+	// Input: Claude Code user input line "❯ <text>" — non-empty prompt
+	EventInput: regexp.MustCompile(`(?m)^❯\s+\S.+`),
+}
+
+// cooldowns defines per-event-type debounce durations.
+// Input events use a longer window to avoid re-firing the same command.
+var cooldowns = map[EventType]time.Duration{
+	EventInput: 10 * time.Second,
 }
 
 // toolCallPattern matches Claude Code tool invocation lines like "⏺ Bash(...)" or "⏺ Edit(...)".
@@ -68,14 +77,28 @@ func DetectEvents(sessionName, output string) []Event {
 	now := time.Now()
 
 	for eventType, pat := range patterns {
-		if match := pat.FindString(output); match != "" {
-			events = append(events, Event{
-				Type:      eventType,
-				Session:   sessionName,
-				Content:   match,
-				Timestamp: now,
-			})
+		match := pat.FindString(output)
+		if match == "" {
+			continue
 		}
+		content := match
+		if eventType == EventInput {
+			// Strip the leading "❯ " prompt marker to surface just the command text.
+			content = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(match), "❯"))
+			// Skip numbered approval option lines like "1. Yes", "2. No (safer…)"
+			if len(content) >= 2 && content[0] >= '0' && content[0] <= '9' && content[1] == '.' {
+				continue
+			}
+			if content == "" {
+				continue
+			}
+		}
+		events = append(events, Event{
+			Type:      eventType,
+			Session:   sessionName,
+			Content:   content,
+			Timestamp: now,
+		})
 	}
 	return events
 }
@@ -196,7 +219,11 @@ func (w *Watcher) poll() {
 			if w.lastEvent[name] == nil {
 				w.lastEvent[name] = make(map[EventType]time.Time)
 			}
-			if last, ok := w.lastEvent[name][ev.Type]; ok && time.Since(last) < 2*time.Second {
+			cd := 2 * time.Second
+			if d, ok := cooldowns[ev.Type]; ok {
+				cd = d
+			}
+			if last, ok := w.lastEvent[name][ev.Type]; ok && time.Since(last) < cd {
 				w.mu.Unlock()
 				continue
 			}
