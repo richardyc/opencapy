@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,7 @@ const (
 	EventIdle     EventType = "idle"
 	EventCrash    EventType = "crash"
 	EventDone     EventType = "done"
+	EventInput    EventType = "input"
 )
 
 // Event represents a detected CC event in a tmux pane.
@@ -31,12 +33,42 @@ type Event struct {
 }
 
 var patterns = map[EventType]*regexp.Regexp{
-	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|yes.*no|\[y/n\]|❯\s*1\.?\s*yes)`),
-	EventThinking: regexp.MustCompile(`(?i)(architecting\.\.\.|thinking\.\.\.|analyzing\.\.\.|✶)`),
-	EventFileEdit: regexp.MustCompile(`(?i)(edited?:\s*|created?:\s*|modified?:\s*)(.+)`),
-	EventIdle:     regexp.MustCompile(`(?m)^❯\s*$`),
-	EventCrash:    regexp.MustCompile(`(?i)(traceback|error:|panic:|fatal:|exception:)`),
-	EventDone:     regexp.MustCompile(`(?i)(task complete|all done|finished)`),
+	// Claude Code prompts approval with numbered options like "❯ 1. Yes" / "1 Yes"
+	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|\[y/n\]|❯\s*1\.?\s*yes|^\s*1\s+yes)`),
+	// Claude Code thinking spinner (✶) — distinct from tool-call lines (⏺)
+	EventThinking: regexp.MustCompile(`✶`),
+	// Claude Code shows Edit/Write/Create tool calls with a leading ⏺
+	EventFileEdit: regexp.MustCompile(`⏺\s+(Edit|Write|Create)\(`),
+	// Idle: shell prompt alone on a line (zsh ❯ or bash $)
+	EventIdle: regexp.MustCompile(`(?m)^❯\s*$`),
+	// Crash: language-specific crash indicators at line start, not general "error:"
+	EventCrash: regexp.MustCompile(`(?im)^\s*(Traceback \(most recent call last\)|panic:|fatal error:|FATAL ERROR:)`),
+	// Done: Claude Code's specific completion phrase
+	EventDone: regexp.MustCompile(`(?i)(task complete|claude code (is done|has finished|finished the task))`),
+	// Input: Claude Code user input line "❯ <text>" — non-empty prompt
+	EventInput: regexp.MustCompile(`(?m)^❯\s+\S.+`),
+}
+
+// cooldowns defines per-event-type debounce durations.
+// Input events use a longer window to avoid re-firing the same command.
+var cooldowns = map[EventType]time.Duration{
+	EventInput: 10 * time.Second,
+}
+
+// toolCallPattern matches Claude Code tool invocation lines like "⏺ Bash(...)" or "⏺ Edit(...)".
+var toolCallPattern = regexp.MustCompile(`⏺\s+\w[\w\s]*\(`)
+
+// extractApprovalContext scans the full pane output (top→bottom) and returns
+// the last tool-call line seen before the approval prompt. Falls back to a
+// generic message if no tool call is found.
+func extractApprovalContext(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if toolCallPattern.MatchString(lines[i]) {
+			return strings.TrimSpace(lines[i])
+		}
+	}
+	return "Claude Code needs approval"
 }
 
 // DetectEvents scans pane output and returns matched events.
@@ -45,14 +77,28 @@ func DetectEvents(sessionName, output string) []Event {
 	now := time.Now()
 
 	for eventType, pat := range patterns {
-		if match := pat.FindString(output); match != "" {
-			events = append(events, Event{
-				Type:      eventType,
-				Session:   sessionName,
-				Content:   match,
-				Timestamp: now,
-			})
+		match := pat.FindString(output)
+		if match == "" {
+			continue
 		}
+		content := match
+		if eventType == EventInput {
+			// Strip the leading "❯ " prompt marker to surface just the command text.
+			content = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(match), "❯"))
+			// Skip numbered approval option lines like "1. Yes", "2. No (safer…)"
+			if len(content) >= 2 && content[0] >= '0' && content[0] <= '9' && content[1] == '.' {
+				continue
+			}
+			if content == "" {
+				continue
+			}
+		}
+		events = append(events, Event{
+			Type:      eventType,
+			Session:   sessionName,
+			Content:   content,
+			Timestamp: now,
+		})
 	}
 	return events
 }
@@ -131,6 +177,9 @@ func (w *Watcher) poll() {
 	w.mu.RUnlock()
 
 	for _, name := range names {
+		// Capture 20 lines for hash (change detection), but only run pattern
+		// matching against the last 5 lines so we detect the *current* pane
+		// state and not historical output (e.g., code diffs shown by Claude Code).
 		output, err := tmux.CapturePaneOutput(name, 20)
 		if err != nil {
 			continue
@@ -149,14 +198,32 @@ func (w *Watcher) poll() {
 		w.lastHash[name] = hash
 		w.mu.Unlock()
 
-		events := DetectEvents(name, output)
+		// Only analyse the bottom 5 lines for current state detection.
+		lines := strings.Split(output, "\n")
+		if len(lines) > 5 {
+			lines = lines[len(lines)-5:]
+		}
+		tail := strings.Join(lines, "\n")
+
+		events := DetectEvents(name, tail)
+		// For approval events, enrich the content with the actual tool call
+		// from the broader pane context rather than just the regex match text.
+		for i, ev := range events {
+			if ev.Type == EventApproval {
+				events[i].Content = extractApprovalContext(output)
+			}
+		}
 		for _, ev := range events {
 			// 2-second cooldown per (session, event type)
 			w.mu.Lock()
 			if w.lastEvent[name] == nil {
 				w.lastEvent[name] = make(map[EventType]time.Time)
 			}
-			if last, ok := w.lastEvent[name][ev.Type]; ok && time.Since(last) < 2*time.Second {
+			cd := 2 * time.Second
+			if d, ok := cooldowns[ev.Type]; ok {
+				cd = d
+			}
+			if last, ok := w.lastEvent[name][ev.Type]; ok && time.Since(last) < cd {
 				w.mu.Unlock()
 				continue
 			}
