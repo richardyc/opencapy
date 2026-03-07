@@ -121,6 +121,36 @@ func newDaemonCmd() *cobra.Command {
 				}()
 			}
 
+			// Hot-reload: watch sessions.json every 2s, add new sessions dynamically.
+			go func() {
+				ticker := time.NewTicker(2 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						fresh, err := project.Load()
+						if err != nil {
+							continue
+						}
+						for name, path := range fresh.All() {
+							if !w.HasSession(name) {
+								w.AddSession(name, path)
+								if fw != nil {
+									_ = fw.AddProject(path)
+								}
+								if reg != nil {
+									_ = reg.Register(name, path)
+								}
+								// Notify connected iOS clients of the new session.
+								srv.BroadcastSnapshot()
+							}
+						}
+					}
+				}
+			}()
+
 			fmt.Printf("OpenCapy daemon starting on :%d\n", cfg.Port)
 			fmt.Printf("Host: %s\n", platform.Hostname())
 

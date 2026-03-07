@@ -78,6 +78,14 @@ func New(interval time.Duration) *Watcher {
 	}
 }
 
+// HasSession returns true if the session is already registered.
+func (w *Watcher) HasSession(name string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, ok := w.sessions[name]
+	return ok
+}
+
 // AddSession registers a session for watching.
 func (w *Watcher) AddSession(name, projectPath string) {
 	w.mu.Lock()
