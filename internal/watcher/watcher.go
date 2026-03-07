@@ -35,8 +35,8 @@ type Event struct {
 var patterns = map[EventType]*regexp.Regexp{
 	// Claude Code prompts approval with numbered options like "❯ 1. Yes" / "1 Yes"
 	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|\[y/n\]|❯\s*1\.?\s*yes|^\s*1\s+yes)`),
-	// Claude Code thinking spinner starts with ✶ or ⏺
-	EventThinking: regexp.MustCompile(`✶|⏺\s+\w`),
+	// Claude Code thinking spinner (✶) — distinct from tool-call lines (⏺)
+	EventThinking: regexp.MustCompile(`✶`),
 	// Claude Code shows Edit/Write/Create tool calls with a leading ⏺
 	EventFileEdit: regexp.MustCompile(`⏺\s+(Edit|Write|Create)\(`),
 	// Idle: shell prompt alone on a line (zsh ❯ or bash $)
