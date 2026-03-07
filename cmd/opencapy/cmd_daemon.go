@@ -14,6 +14,7 @@ import (
 	"github.com/richardyc/opencapy/internal/platform"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/push"
+	ptymanager "github.com/richardyc/opencapy/internal/pty"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/richardyc/opencapy/internal/watcher"
 	"github.com/richardyc/opencapy/internal/ws"
@@ -88,8 +89,23 @@ func newDaemonCmd() *cobra.Command {
 				}
 			}
 
+			// Create PTY manager
+			ptyMgr := ptymanager.NewManager()
+
 			// Start WebSocket server
-			srv := ws.New(cfg.Port, w.Events(), reg, pushReg)
+			srv := ws.New(cfg.Port, w.Events(), reg, pushReg, ptyMgr)
+
+			// Forward PTY output events to the owning WebSocket client only
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case out := <-ptyMgr.Events():
+						srv.SendPTYOutput(out)
+					}
+				}
+			}()
 
 			// Start file watcher
 			fw, fwErr := fsevent.New()
