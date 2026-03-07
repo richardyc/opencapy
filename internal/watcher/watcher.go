@@ -46,6 +46,22 @@ var patterns = map[EventType]*regexp.Regexp{
 	EventDone: regexp.MustCompile(`(?i)(task complete|claude code (is done|has finished|finished the task))`),
 }
 
+// toolCallPattern matches Claude Code tool invocation lines like "⏺ Bash(...)" or "⏺ Edit(...)".
+var toolCallPattern = regexp.MustCompile(`⏺\s+\w[\w\s]*\(`)
+
+// extractApprovalContext scans the full pane output (top→bottom) and returns
+// the last tool-call line seen before the approval prompt. Falls back to a
+// generic message if no tool call is found.
+func extractApprovalContext(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if toolCallPattern.MatchString(lines[i]) {
+			return strings.TrimSpace(lines[i])
+		}
+	}
+	return "Claude Code needs approval"
+}
+
 // DetectEvents scans pane output and returns matched events.
 func DetectEvents(sessionName, output string) []Event {
 	var events []Event
@@ -167,6 +183,13 @@ func (w *Watcher) poll() {
 		tail := strings.Join(lines, "\n")
 
 		events := DetectEvents(name, tail)
+		// For approval events, enrich the content with the actual tool call
+		// from the broader pane context rather than just the regex match text.
+		for i, ev := range events {
+			if ev.Type == EventApproval {
+				events[i].Content = extractApprovalContext(output)
+			}
+		}
 		for _, ev := range events {
 			// 2-second cooldown per (session, event type)
 			w.mu.Lock()
