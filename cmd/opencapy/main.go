@@ -25,6 +25,7 @@ func main() {
 	rootCmd.AddCommand(
 		newLsCmd(),
 		newNewCmd(),
+		newHereCmd(),
 		newAttachCmd(),
 		newKillCmd(),
 		newApproveCmd(),
