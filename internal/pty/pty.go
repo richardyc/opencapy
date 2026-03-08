@@ -10,6 +10,20 @@ import (
 	"github.com/creack/pty"
 )
 
+// tmuxBin returns the absolute path to tmux, checking common Homebrew locations
+// when the binary is not in the process PATH (e.g. when running as a LaunchAgent).
+func tmuxBin() string {
+	if p, err := exec.LookPath("tmux"); err == nil {
+		return p
+	}
+	for _, p := range []string{"/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "tmux"
+}
+
 // PTYOutput is a chunk of data read from a PTY session.
 type PTYOutput struct {
 	Session  string
@@ -55,7 +69,8 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 		return fmt.Errorf("pty session %q already open", sessionName)
 	}
 
-	cmd := exec.Command("tmux", "attach-session", "-t", sessionName)
+	cmd := exec.Command(tmuxBin(), "attach-session", "-t", sessionName)
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
 		Cols: uint16(cols),
 		Rows: uint16(rows),
