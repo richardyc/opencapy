@@ -29,7 +29,6 @@ func ensureDaemon() {
 		conn.Close()
 		return // already running
 	}
-	// Not running — launch in background.
 	self, err := os.Executable()
 	if err != nil {
 		self = "opencapy"
@@ -39,11 +38,11 @@ func ensureDaemon() {
 	proc.Stderr = nil
 	if err := proc.Start(); err == nil {
 		fmt.Println("→ daemon started in background (port", cfg.Port, ")")
-		// Brief pause so daemon is ready before we attach.
 		time.Sleep(300 * time.Millisecond)
 	}
 }
 
+// runRoot is the default command: interactive chooser (no args) or attach-only (with name).
 func runRoot(cmd *cobra.Command, args []string) error {
 	ensureDaemon()
 
@@ -53,128 +52,62 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(args) == 0 {
-		// No args: create or attach for the current directory (main dev workflow).
-		return createOrAttach(filepath.Base(cwd), cwd)
+		// No args → interactive chooser. Includes a "new session here" option.
+		return runChooser(cwd)
 	}
 
-	// With an explicit name: attach ONLY. A typo should fail, not silently create a session.
+	// Explicit name → attach ONLY. Typos fail loudly; use 'opencapy new' to create.
 	name := args[0]
 	exists, err := tmux.SessionExists(name)
 	if err != nil {
 		return fmt.Errorf("check session: %w", err)
 	}
 	if !exists {
-		return fmt.Errorf("session %q not found\n  → run 'opencapy new %s' to create it", name, name)
+		return fmt.Errorf("session %q not found — use 'opencapy new %s' to create it", name, name)
 	}
 	fmt.Printf("Attaching to session %q\n", name)
 	return tmux.Attach(name)
 }
 
-// createOrAttach creates session `name` in `cwd` if it doesn't exist, then attaches.
-func createOrAttach(name, cwd string) error {
-	exists, err := tmux.SessionExists(name)
-	if err != nil {
-		return fmt.Errorf("check session: %w", err)
-	}
-	if exists {
-		fmt.Printf("Attaching to existing session %q\n", name)
-		return tmux.Attach(name)
-	}
+// runChooser shows the interactive session picker and handles creation.
+// The special "[+] new" entry creates a session named after cwd.
+func runChooser(cwd string) error {
+	sessions, _ := tmux.ListSessions()
+	reg, _ := project.Load()
 
+	// fzf path
+	if _, err := exec.LookPath("fzf"); err == nil {
+		return fzfChooser(sessions, reg, cwd)
+	}
+	// Fallback: numbered list
+	return numberedChooser(sessions, reg, cwd)
+}
+
+// createSession creates and registers a new session, then attaches.
+func createSession(name, cwd string) error {
 	if err := tmux.NewSession(name, cwd); err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
-
 	reg, err := project.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not load registry: %v\n", err)
 	} else if err := reg.Register(name, cwd); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not register session: %v\n", err)
 	}
-
 	fmt.Printf("Created session %q (%s)\n", name, cwd)
 	return tmux.Attach(name)
 }
 
-func newLsCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "ls",
-		Short: "Interactive session manager (attach or kill)",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			sessions, err := tmux.ListSessions()
-			if err != nil {
-				return fmt.Errorf("list sessions: %w", err)
-			}
-			if len(sessions) == 0 {
-				fmt.Println("No active sessions. Create one with 'opencapy new'.")
-				return nil
-			}
+// newTag is the sentinel value used in the chooser to represent "create new session".
+const newTag = "\x00new"
 
-			reg, _ := project.Load()
+// fzfChooser shows a fzf menu with a "[+] new" option at the top.
+func fzfChooser(sessions []tmux.Session, reg *project.Registry, cwd string) error {
+	cwdName := filepath.Base(cwd)
 
-			// Inside tmux: use the native tmux chooser (C-b s equivalent).
-			// Supports arrow keys, Enter=attach, x=kill, q=quit.
-			if os.Getenv("TMUX") != "" {
-				return exec.Command("tmux", "choose-session").Run()
-			}
-
-			// Outside tmux: use fzf if available.
-			if _, err := exec.LookPath("fzf"); err == nil {
-				return fzfChooser(sessions, reg)
-			}
-
-			// Fallback: numbered list.
-			return numberedChooser(sessions, reg)
-		},
-	}
-}
-
-func newNewCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "new [name]",
-		Short: "Create a new session (defaults to current directory name)",
-		Args:  cobra.MaximumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ensureDaemon()
-
-			cwd, err := os.Getwd()
-			if err != nil {
-				return fmt.Errorf("get working directory: %w", err)
-			}
-
-			name := filepath.Base(cwd)
-			if len(args) > 0 {
-				name = args[0]
-			}
-
-			exists, err := tmux.SessionExists(name)
-			if err != nil {
-				return fmt.Errorf("check session: %w", err)
-			}
-			if exists {
-				return fmt.Errorf("session %q already exists — use 'opencapy %s' to attach", name, name)
-			}
-
-			if err := tmux.NewSession(name, cwd); err != nil {
-				return fmt.Errorf("create session: %w", err)
-			}
-
-			reg, err := project.Load()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not load registry: %v\n", err)
-			} else if err := reg.Register(name, cwd); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not register session: %v\n", err)
-			}
-
-			fmt.Printf("Created session %q (%s)\n", name, cwd)
-			return tmux.Attach(name)
-		},
-	}
-}
-
-// fzfChooser pipes sessions through fzf and attaches to the selection.
-func fzfChooser(sessions []tmux.Session, reg *project.Registry) error {
 	var sb strings.Builder
+	// "New session" entry first — tab-separated so field {1} is the sentinel.
+	fmt.Fprintf(&sb, "%s\t[+] new  %s  (%s)\n", newTag, cwdName, cwd)
 	for _, s := range sessions {
 		path := s.Cwd
 		if reg != nil {
@@ -182,33 +115,43 @@ func fzfChooser(sessions []tmux.Session, reg *project.Registry) error {
 				path = p
 			}
 		}
-		fmt.Fprintf(&sb, "%s\t%s\n", s.Name, path)
+		fmt.Fprintf(&sb, "%s\t%s  %s\n", s.Name, s.Name, path)
 	}
 
 	fzf := exec.Command("fzf",
 		"--height=40%", "--reverse", "--no-multi",
 		"--prompt=opencapy > ",
-		"--header=Enter: attach   Ctrl-C: cancel",
-		"--delimiter=\t", "--with-nth=1,2",
+		"--header=Enter: attach/new   Ctrl-C: cancel",
+		"--delimiter=\t",
+		"--with-nth=2", // show only the display column
 	)
 	fzf.Stdin = strings.NewReader(sb.String())
 	fzf.Stderr = os.Stderr
 
 	out, err := fzf.Output()
 	if err != nil {
-		return nil // user cancelled
+		return nil // cancelled
 	}
+
+	// The output is the display column; we need the key (first field of original input).
+	// fzf's --with-nth hides the first field but output is still the full original line.
 	line := strings.TrimSpace(string(out))
 	if line == "" {
 		return nil
 	}
-	name := strings.SplitN(line, "\t", 2)[0]
-	return tmux.Attach(name)
+	key := strings.SplitN(line, "\t", 2)[0]
+
+	if key == newTag {
+		return createSession(cwdName, cwd)
+	}
+	return tmux.Attach(key)
 }
 
-// numberedChooser shows a numbered list and attaches to the chosen session.
-func numberedChooser(sessions []tmux.Session, reg *project.Registry) error {
-	fmt.Println("Active sessions:")
+// numberedChooser shows a numbered list with "[n]ew" option at the top.
+func numberedChooser(sessions []tmux.Session, reg *project.Registry, cwd string) error {
+	cwdName := filepath.Base(cwd)
+
+	fmt.Printf("  [n] new   Create session %q (%s)\n", cwdName, cwd)
 	for i, s := range sessions {
 		path := s.Cwd
 		if reg != nil {
@@ -218,7 +161,7 @@ func numberedChooser(sessions []tmux.Session, reg *project.Registry) error {
 		}
 		fmt.Printf("  [%d] %-20s  %s\n", i+1, s.Name, path)
 	}
-	fmt.Print("\nAttach to (number or name, Enter to cancel): ")
+	fmt.Print("\nChoice (n=new, number, or session name): ")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	if !scanner.Scan() {
@@ -228,9 +171,11 @@ func numberedChooser(sessions []tmux.Session, reg *project.Registry) error {
 	if input == "" || input == "q" {
 		return nil
 	}
-
-	if n, err := strconv.Atoi(input); err == nil && n >= 1 && n <= len(sessions) {
-		return tmux.Attach(sessions[n-1].Name)
+	if input == "n" || input == "new" {
+		return createSession(cwdName, cwd)
+	}
+	if idx, err := strconv.Atoi(input); err == nil && idx >= 1 && idx <= len(sessions) {
+		return tmux.Attach(sessions[idx-1].Name)
 	}
 	for _, s := range sessions {
 		if s.Name == input {
@@ -238,6 +183,48 @@ func numberedChooser(sessions []tmux.Session, reg *project.Registry) error {
 		}
 	}
 	return fmt.Errorf("session %q not found", input)
+}
+
+func newLsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ls",
+		Short: "Interactive session manager (same as running opencapy with no args)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ensureDaemon()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("get working directory: %w", err)
+			}
+			return runChooser(cwd)
+		},
+	}
+}
+
+func newNewCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "new [name]",
+		Short: "Create a new session (name defaults to current directory)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ensureDaemon()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("get working directory: %w", err)
+			}
+			name := filepath.Base(cwd)
+			if len(args) > 0 {
+				name = args[0]
+			}
+			exists, err := tmux.SessionExists(name)
+			if err != nil {
+				return fmt.Errorf("check session: %w", err)
+			}
+			if exists {
+				return fmt.Errorf("session %q already exists — use 'opencapy %s' to attach", name, name)
+			}
+			return createSession(name, cwd)
+		},
+	}
 }
 
 func newAttachCmd() *cobra.Command {
@@ -258,17 +245,13 @@ func newKillCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
-
 			if err := tmux.KillSession(name); err != nil {
 				return fmt.Errorf("kill session: %w", err)
 			}
-
-			// Remove from registry
 			reg, err := project.Load()
 			if err == nil {
 				_ = reg.Unregister(name)
 			}
-
 			fmt.Printf("Killed session %q\n", name)
 			return nil
 		},
