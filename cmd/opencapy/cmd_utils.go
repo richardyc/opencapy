@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -133,10 +136,15 @@ func newUpdateCmd() *cobra.Command {
 }
 
 func newInstallCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install daemon as system service (LaunchAgent on Mac, systemd on Linux)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			vscode, _ := cmd.Flags().GetBool("vscode")
+			if vscode {
+				return installVSCode()
+			}
+
 			binaryPath, err := os.Executable()
 			if err != nil {
 				return fmt.Errorf("find binary path: %w", err)
@@ -165,4 +173,138 @@ func newInstallCmd() *cobra.Command {
 			return fmt.Errorf("unsupported platform")
 		},
 	}
+	cmd.Flags().Bool("vscode", false, "Configure VSCode/Cursor terminal to use opencapy automatically")
+	return cmd
+}
+
+// editorSettingsPaths returns candidate settings.json paths for known editors.
+func editorSettingsPaths() []string {
+	home, _ := os.UserHomeDir()
+	var paths []string
+	if runtime.GOOS == "darwin" {
+		base := filepath.Join(home, "Library", "Application Support")
+		paths = []string{
+			filepath.Join(base, "Code", "User", "settings.json"),
+			filepath.Join(base, "Cursor", "User", "settings.json"),
+			filepath.Join(base, "VSCodium", "User", "settings.json"),
+		}
+	} else {
+		cfg := filepath.Join(home, ".config")
+		paths = []string{
+			filepath.Join(cfg, "Code", "User", "settings.json"),
+			filepath.Join(cfg, "Cursor", "User", "settings.json"),
+			filepath.Join(cfg, "VSCodium", "User", "settings.json"),
+		}
+	}
+	return paths
+}
+
+// platformKey returns the VSCode OS-specific settings key (osx, linux, windows).
+func platformKey() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "osx"
+	case "windows":
+		return "windows"
+	default:
+		return "linux"
+	}
+}
+
+func installVSCode() error {
+	paths := editorSettingsPaths()
+
+	// Find which editors are installed.
+	var found []string
+	for _, p := range paths {
+		if _, err := os.Stat(filepath.Dir(p)); err == nil {
+			found = append(found, p)
+		}
+	}
+
+	if len(found) == 0 {
+		printVSCodeSnippet()
+		return nil
+	}
+
+	ok := false
+	for _, settingsPath := range found {
+		editor := filepath.Base(filepath.Dir(filepath.Dir(settingsPath)))
+		if err := patchVSCodeSettings(settingsPath); err != nil {
+			fmt.Fprintf(os.Stderr, "  ✗ %s (%s): %v\n", editor, settingsPath, err)
+		} else {
+			fmt.Printf("  ✓ %s — opencapy set as default terminal\n", editor)
+			ok = true
+		}
+	}
+
+	if ok {
+		fmt.Println("\nRestart your editor and every new terminal will open inside opencapy.")
+		fmt.Println("Tip: 'opencapy here' is the underlying command — use it in any editor that supports custom terminal profiles.")
+	}
+	return nil
+}
+
+func patchVSCodeSettings(path string) error {
+	osKey := platformKey()
+	profilesKey := "terminal.integrated.profiles." + osKey
+	defaultKey := "terminal.integrated.defaultProfile." + osKey
+
+	// Read existing settings (create empty file if missing).
+	var raw map[string]interface{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		raw = make(map[string]interface{})
+	} else {
+		if err := json.Unmarshal(data, &raw); err != nil {
+			// Likely JSONC with comments — print snippet instead.
+			fmt.Printf("  ! Could not parse %s (may contain comments).\n", path)
+			fmt.Println("    Add this manually:")
+			printVSCodeSnippet()
+			return nil
+		}
+	}
+
+	// Merge opencapy profile into existing profiles map.
+	profiles, _ := raw[profilesKey].(map[string]interface{})
+	if profiles == nil {
+		profiles = make(map[string]interface{})
+	}
+	profiles["opencapy"] = map[string]interface{}{
+		"path": "bash",
+		"args": []string{"-c", "opencapy here"},
+		"icon": "terminal-tmux",
+	}
+	raw[profilesKey] = profiles
+	raw[defaultKey] = "opencapy"
+
+	out, err := json.MarshalIndent(raw, "", "    ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
+}
+
+func printVSCodeSnippet() {
+	osKey := platformKey()
+	fmt.Printf(`
+Add to your editor's settings.json (Cmd+Shift+P → "Open User Settings JSON"):
+
+    "terminal.integrated.profiles.%s": {
+        "opencapy": {
+            "path": "bash",
+            "args": ["-c", "opencapy here"],
+            "icon": "terminal-tmux"
+        }
+    },
+    "terminal.integrated.defaultProfile.%s": "opencapy"
+
+`, osKey, osKey)
 }

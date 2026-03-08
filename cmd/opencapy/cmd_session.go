@@ -185,6 +185,31 @@ func numberedChooser(sessions []tmux.Session, reg *project.Registry, cwd string)
 	return fmt.Errorf("session %q not found", input)
 }
 
+// newHereCmd is the non-interactive create-or-attach command used in editor
+// terminal profiles (VSCode, Cursor). It never shows a chooser.
+func newHereCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "here",
+		Short: "Create or attach to a session for the current directory (for editor integration)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ensureDaemon()
+			cwd, err := os.Getwd()
+			if err != nil {
+				return fmt.Errorf("get working directory: %w", err)
+			}
+			name := filepath.Base(cwd)
+			exists, err := tmux.SessionExists(name)
+			if err != nil {
+				return fmt.Errorf("check session: %w", err)
+			}
+			if exists {
+				return tmux.Attach(name)
+			}
+			return createSession(name, cwd)
+		},
+	}
+}
+
 func newLsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ls",
