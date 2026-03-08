@@ -135,6 +135,12 @@ Without this config the daemon runs fine — push notifications are disabled, al
 
 Coming soon on TestFlight. Source: [richardyc/opencapy-ios](https://github.com/richardyc/opencapy-ios)
 
+## Building a client
+
+OpenCapy is an open protocol — anyone can build a client that connects to the daemon. The WebSocket message format is documented in the [WebSocket protocol](#websocket-protocol) section above.
+
+> **TODO:** publish a formal `PROTOCOL.md` once the protocol stabilizes (PTY, file tree, and push are still evolving).
+
 ## License
 
 MIT
