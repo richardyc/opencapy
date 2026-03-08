@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"syscall"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
@@ -106,33 +107,66 @@ func newUpdateCmd() *cobra.Command {
 			plistPath := home + "/Library/LaunchAgents/com.opencapy.daemon.plist"
 
 			if platform.IsMacOS() {
-				// Restart via launchctl if the plist is installed, otherwise signal.
 				if _, err := os.Stat(plistPath); err == nil {
+					// Installed as LaunchAgent — unload/load handles the restart.
 					exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
 					if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
 						return fmt.Errorf("launchctl load: %w", err)
 					}
-					fmt.Println("Daemon restarted via LaunchAgent. Done.")
-					return nil
+				} else {
+					// Not a service — kill old daemon and spawn new one detached.
+					exec.Command("pkill", "-f", "opencapy daemon").Run() //nolint:errcheck
+					time.Sleep(300 * time.Millisecond)
+					binaryPath, _ := os.Executable()
+					daemon := exec.Command(binaryPath, "daemon")
+					daemon.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+					daemon.Stdout = nil
+					daemon.Stderr = nil
+					daemon.Stdin = nil
+					if err := daemon.Start(); err != nil {
+						return fmt.Errorf("start daemon: %w", err)
+					}
 				}
-				// Not installed as service — just kill the running process so the user
-				// can start the new one themselves.
-				exec.Command("pkill", "-f", "opencapy daemon").Run() //nolint:errcheck
-				fmt.Println("Old daemon stopped. Run `opencapy daemon` (or set up autostart with `opencapy install`).")
-				return nil
+				return verifyDaemon()
 			}
 
 			if platform.IsLinux() {
 				if err := exec.Command("sudo", "systemctl", "restart", "opencapy").Run(); err != nil {
 					return fmt.Errorf("systemctl restart: %w", err)
 				}
-				fmt.Println("Daemon restarted via systemd. Done.")
-				return nil
+				return verifyDaemon()
 			}
 
 			return fmt.Errorf("unsupported platform — restart the daemon manually")
 		},
 	}
+}
+
+// verifyDaemon waits for the daemon port to be reachable and prints version info.
+func verifyDaemon() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	port := strconv.Itoa(cfg.Port)
+
+	fmt.Print("Waiting for daemon")
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 500*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			fmt.Println(" ✔︎")
+			// Print new version from binary.
+			binaryPath, _ := os.Executable()
+			out, _ := exec.Command(binaryPath, "version").Output()
+			fmt.Printf("Running: %s", out)
+			return nil
+		}
+		fmt.Print(".")
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("daemon did not start within 8s — run `opencapy daemon` manually")
 }
 
 func newInstallCmd() *cobra.Command {
