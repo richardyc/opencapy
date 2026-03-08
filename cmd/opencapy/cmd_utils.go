@@ -94,6 +94,15 @@ func newUpdateCmd() *cobra.Command {
 		Use:   "update",
 		Short: "Upgrade opencapy to the latest version and restart the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Check if an upgrade is actually available before doing anything.
+			outdated, _ := exec.Command("brew", "outdated", "--quiet", "opencapy").Output()
+			if len(outdated) == 0 {
+				binaryPath, _ := os.Executable()
+				ver, _ := exec.Command(binaryPath, "version").Output()
+				fmt.Printf("Already on the latest version. %s", ver)
+				return nil
+			}
+
 			fmt.Println("Upgrading opencapy via Homebrew…")
 			upgrade := exec.Command("brew", "upgrade", "opencapy")
 			upgrade.Stdout = os.Stdout
