@@ -46,6 +46,9 @@ type InboundMessage struct {
 	// File fields
 	Path    string `json:"path,omitempty"`
 	Content string `json:"content,omitempty"` // base64 for file_write
+	// Session creation fields
+	Mode        string `json:"mode,omitempty"`         // "chat" or "terminal"
+	ProjectPath string `json:"project_path,omitempty"` // working directory for new session
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -456,6 +459,9 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		default:
 		}
 
+	case "new_session":
+		s.handleNewSession(client, msg)
+
 	case "file_write":
 		if msg.Path == "" || msg.Content == "" {
 			break
@@ -493,6 +499,62 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		case client.send <- data:
 		default:
 		}
+	}
+}
+
+func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
+	// Resolve working directory: use provided path, first registered project, or home dir.
+	cwd := msg.ProjectPath
+	if cwd == "" && s.registry != nil {
+		if projects := s.registry.AllProjects(); len(projects) > 0 {
+			cwd = projects[0]
+		}
+	}
+	if cwd == "" {
+		home, _ := os.UserHomeDir()
+		cwd = home
+	}
+
+	// Generate a unique session name.
+	prefix := "term"
+	if msg.Mode == "chat" {
+		prefix = "chat"
+	}
+	name := fmt.Sprintf("%s-%s", prefix, time.Now().Format("0102-150405"))
+
+	if err := tmux.NewSession(name, cwd); err != nil {
+		log.Printf("new_session create %q: %v", name, err)
+		data, _ := json.Marshal(OutboundMessage{
+			Type:    "error",
+			Payload: map[string]string{"message": "failed to create session: " + err.Error()},
+		})
+		select {
+		case client.send <- data:
+		default:
+		}
+		return
+	}
+
+	// For chat mode, launch the AI assistant after a brief shell init delay.
+	if msg.Mode == "chat" {
+		time.Sleep(300 * time.Millisecond)
+		_ = tmux.SendKeys(name, "claude")
+	}
+
+	// Broadcast a fresh snapshot so all clients see the new session appear.
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		s.BroadcastSnapshot()
+	}()
+
+	// Ack with the new session name.
+	data, _ := json.Marshal(OutboundMessage{
+		Type:    "session_created",
+		Payload: map[string]string{"name": name, "mode": msg.Mode},
+	})
+	select {
+	case client.send <- data:
+	default:
 	}
 }
 
