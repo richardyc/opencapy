@@ -219,8 +219,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Send snapshot of current sessions to newly connected client
+	// Send snapshot of current sessions to newly connected client.
+	// Recover from "send on closed channel" if the client disconnects before
+	// the (potentially slow) snapshotSessions call finishes.
 	go func() {
+		defer func() { recover() }() //nolint:errcheck
 		snapshots := s.snapshotSessions()
 		msg := OutboundMessage{Type: "snapshot", Payload: snapshots}
 		data, err := json.Marshal(msg)

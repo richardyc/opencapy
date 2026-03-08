@@ -6,9 +6,40 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
+
+// tmuxPath returns the absolute path to the tmux binary.
+// LaunchAgent / systemd environments often have a minimal PATH that omits
+// Homebrew (/opt/homebrew/bin) or /usr/local/bin, so we fall back to known
+// locations when exec.LookPath fails.
+var (
+	tmuxBin     string
+	tmuxBinOnce sync.Once
+)
+
+func tmuxPath() string {
+	tmuxBinOnce.Do(func() {
+		if p, err := exec.LookPath("tmux"); err == nil {
+			tmuxBin = p
+			return
+		}
+		for _, p := range []string{
+			"/opt/homebrew/bin/tmux", // Apple Silicon Homebrew
+			"/usr/local/bin/tmux",    // Intel Homebrew / Linux
+			"/usr/bin/tmux",
+		} {
+			if _, err := os.Stat(p); err == nil {
+				tmuxBin = p
+				return
+			}
+		}
+		tmuxBin = "tmux" // last resort
+	})
+	return tmuxBin
+}
 
 // Session represents a tmux session.
 type Session struct {
@@ -38,27 +69,27 @@ func ApplyScrollConfig() {
 	if err := os.WriteFile(path, []byte(scrollConf), 0o644); err != nil {
 		return
 	}
-	_ = exec.Command("tmux", "source-file", path).Run()
+	_ = exec.Command(tmuxPath(),"source-file", path).Run()
 }
 
 // NewSession creates a new detached tmux session with the opencapy capybara status bar.
 func NewSession(name, cwd string) error {
-	cmd := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", cwd)
+	cmd := exec.Command(tmuxPath(),"new-session", "-d", "-s", name, "-c", cwd)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return err
 	}
 	// Set capybara brown status bar on this session only.
-	_ = exec.Command("tmux", "set-option", "-t", name,
+	_ = exec.Command(tmuxPath(),"set-option", "-t", name,
 		"status-style", "bg="+CapybaraColor+",fg=#F5E6D3").Run()
 	// Enable mouse so trackpad scroll works without entering copy mode.
-	_ = exec.Command("tmux", "set-option", "-t", name, "mouse", "on").Run()
+	_ = exec.Command(tmuxPath(),"set-option", "-t", name, "mouse", "on").Run()
 	return nil
 }
 
 // ListSessions returns all current tmux sessions.
 func ListSessions() ([]Session, error) {
-	cmd := exec.Command("tmux", "list-sessions", "-F",
+	cmd := exec.Command(tmuxPath(),"list-sessions", "-F",
 		"#{session_name}\t#{session_path}\t#{session_windows}\t#{session_created}")
 	out, err := cmd.Output()
 	if err != nil {
@@ -94,7 +125,7 @@ func ListSessions() ([]Session, error) {
 
 // KillSession kills a tmux session by name.
 func KillSession(name string) error {
-	cmd := exec.Command("tmux", "kill-session", "-t", name)
+	cmd := exec.Command(tmuxPath(),"kill-session", "-t", name)
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
@@ -102,17 +133,14 @@ func KillSession(name string) error {
 // Attach attaches to an existing tmux session.
 // This replaces the current process with tmux attach.
 func Attach(name string) error {
-	tmuxPath, err := exec.LookPath("tmux")
-	if err != nil {
-		return fmt.Errorf("tmux not found: %w", err)
-	}
-	return syscall.Exec(tmuxPath, []string{"tmux", "attach-session", "-t", name}, os.Environ())
+	bin := tmuxPath()
+	return syscall.Exec(bin, []string{bin, "attach-session", "-t", name}, os.Environ())
 }
 
 // CapturePaneOutput captures the last N lines from the active pane.
 func CapturePaneOutput(sessionName string, lines int) (string, error) {
 	start := fmt.Sprintf("-%d", lines)
-	cmd := exec.Command("tmux", "capture-pane", "-t", sessionName, "-p", "-S", start)
+	cmd := exec.Command(tmuxPath(),"capture-pane", "-t", sessionName, "-p", "-S", start)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -122,14 +150,14 @@ func CapturePaneOutput(sessionName string, lines int) (string, error) {
 
 // SendKeys sends keystrokes to a session pane.
 func SendKeys(sessionName, keys string) error {
-	cmd := exec.Command("tmux", "send-keys", "-t", sessionName, keys, "Enter")
+	cmd := exec.Command(tmuxPath(),"send-keys", "-t", sessionName, keys, "Enter")
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 // ActivePane returns the index of the most recently active pane.
 func ActivePane(sessionName string) (string, error) {
-	cmd := exec.Command("tmux", "display-message", "-t", sessionName, "-p", "#{pane_index}")
+	cmd := exec.Command(tmuxPath(),"display-message", "-t", sessionName, "-p", "#{pane_index}")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -139,7 +167,7 @@ func ActivePane(sessionName string) (string, error) {
 
 // SessionExists checks if a session with given name exists.
 func SessionExists(name string) (bool, error) {
-	cmd := exec.Command("tmux", "has-session", "-t", name)
+	cmd := exec.Command(tmuxPath(),"has-session", "-t", name)
 	err := cmd.Run()
 	if err == nil {
 		return true, nil
