@@ -89,11 +89,12 @@ func NewSession(name, cwd string) error {
 
 // ListSessions returns all current tmux sessions.
 func ListSessions() ([]Session, error) {
-	cmd := exec.Command(tmuxPath(),"list-sessions", "-F",
-		"#{session_name}\t#{session_path}\t#{session_windows}\t#{session_created}")
-	out, err := cmd.Output()
+	const sep = "|"
+	cmd := exec.Command(tmuxPath(), "list-sessions", "-F",
+		"#{session_name}"+sep+"#{session_path}"+sep+"#{session_windows}"+sep+"#{session_created}")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// tmux returns error if no server is running
+		// tmux exits 1 when no server is running — treat as empty list, not error.
 		if strings.Contains(err.Error(), "exit status") {
 			return nil, nil
 		}
@@ -105,7 +106,7 @@ func ListSessions() ([]Session, error) {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 4)
+		parts := strings.SplitN(line, sep, 4)
 		if len(parts) < 4 {
 			continue
 		}

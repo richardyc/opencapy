@@ -69,6 +69,15 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
         <string>{{.BinaryPath}}</string>
         <string>daemon</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>TMPDIR</key>
+        <string>{{.TmpDir}}</string>
+        <key>HOME</key>
+        <string>{{.HomeDir}}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -101,8 +110,25 @@ func InstallLaunchAgent(binaryPath string) error {
 	}
 	defer f.Close()
 
+	tmpDir := os.Getenv("TMPDIR")
+	if tmpDir == "" {
+		// Derive from getconf on macOS when TMPDIR is not set.
+		if out, err := exec.Command("getconf", "DARWIN_USER_TEMP_DIR").Output(); err == nil {
+			tmpDir = strings.TrimSpace(string(out))
+		}
+	}
+	if tmpDir == "" {
+		tmpDir = "/tmp"
+	}
+
+	homeDir, _ := os.UserHomeDir()
+
 	tmpl := template.Must(template.New("plist").Parse(plistTemplate))
-	if err := tmpl.Execute(f, struct{ BinaryPath string }{binaryPath}); err != nil {
+	if err := tmpl.Execute(f, struct {
+		BinaryPath string
+		TmpDir     string
+		HomeDir    string
+	}{binaryPath, tmpDir, homeDir}); err != nil {
 		return fmt.Errorf("write plist: %w", err)
 	}
 
