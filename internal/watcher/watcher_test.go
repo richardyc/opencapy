@@ -34,16 +34,12 @@ func TestDetectEvents_NoMatch(t *testing.T) {
 	}
 }
 
-func TestDetectEvents_FileEdit(t *testing.T) {
-	// Claude Code emits tool calls with a leading ⏺ symbol
-	events := DetectEvents("test", "⏺ Edit(src/train.py)")
-	found := false
+func TestDetectEvents_NoCrashOnErrorColon(t *testing.T) {
+	// "Error:" alone must NOT trigger crash — it's common in Claude Code tool output
+	events := DetectEvents("test", "⎿  Error: command failed")
 	for _, e := range events {
-		if e.Type == EventFileEdit {
-			found = true
+		if e.Type == EventCrash {
+			t.Error("Error: should not trigger crash event")
 		}
-	}
-	if !found {
-		t.Fatal("expected file_edit event")
 	}
 }
