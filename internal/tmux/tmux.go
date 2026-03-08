@@ -141,7 +141,8 @@ func Attach(name string) error {
 // CapturePaneOutput captures the last N lines from the active pane.
 func CapturePaneOutput(sessionName string, lines int) (string, error) {
 	start := fmt.Sprintf("-%d", lines)
-	cmd := exec.Command(tmuxPath(),"capture-pane", "-t", sessionName, "-p", "-S", start)
+	// -e preserves ANSI escape sequences so iOS can render colours universally.
+	cmd := exec.Command(tmuxPath(), "capture-pane", "-t", sessionName, "-p", "-e", "-S", start)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
