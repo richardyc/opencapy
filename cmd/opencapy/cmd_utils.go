@@ -106,10 +106,16 @@ func newUpdateCmd() *cobra.Command {
 			upgraded := !strings.Contains(string(upgradeOut), "already installed")
 
 			if !upgraded {
-				binaryPath, _ := os.Executable()
-				ver, _ := exec.Command(binaryPath, "version").Output()
+				newBin, _ := exec.LookPath("opencapy")
+				ver, _ := exec.Command(newBin, "version").Output()
 				fmt.Printf("Already on the latest version. %s", ver)
 				return nil
+			}
+
+			// Brew link may fail if a manually-installed binary occupies the path.
+			// Force the symlink so the new version is active.
+			if strings.Contains(string(upgradeOut), "brew link") {
+				exec.Command("brew", "link", "--overwrite", "opencapy").Run() //nolint:errcheck
 			}
 
 			fmt.Println(strings.TrimSpace(string(upgradeOut)))
