@@ -49,6 +49,8 @@ type InboundMessage struct {
 	// Session creation fields
 	Mode        string `json:"mode,omitempty"`         // "chat" or "terminal"
 	ProjectPath string `json:"project_path,omitempty"` // working directory for new session
+	// Pane capture
+	Lines int `json:"lines,omitempty"` // lines of scrollback to capture
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -457,6 +459,28 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			},
 		}
 		data, _ := json.Marshal(resp)
+		select {
+		case client.send <- data:
+		default:
+		}
+
+	case "capture_pane":
+		if msg.Session == "" {
+			break
+		}
+		lines := msg.Lines
+		if lines <= 0 {
+			lines = 300
+		}
+		output, err := tmux.CapturePaneOutput(msg.Session, lines)
+		if err != nil {
+			log.Printf("capture_pane %q: %v", msg.Session, err)
+			break
+		}
+		data, _ := json.Marshal(OutboundMessage{
+			Type:    "pane_content",
+			Payload: map[string]string{"session": msg.Session, "content": output},
+		})
 		select {
 		case client.send <- data:
 		default:
