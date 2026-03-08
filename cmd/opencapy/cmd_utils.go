@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -94,22 +95,24 @@ func newUpdateCmd() *cobra.Command {
 		Use:   "update",
 		Short: "Upgrade opencapy to the latest version and restart the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Check if an upgrade is actually available before doing anything.
-			outdated, _ := exec.Command("brew", "outdated", "--quiet", "opencapy").Output()
-			if len(outdated) == 0 {
+			// Always run `brew update` first so the local tap cache is fresh,
+			// then attempt the upgrade. Capture stdout/stderr to detect whether
+			// a real upgrade happened (brew exits 0 and prints nothing on
+			// "already latest"; it prints the new version when it upgrades).
+			fmt.Println("Checking for updates…")
+			exec.Command("brew", "update").Run() //nolint:errcheck
+
+			upgradeOut, _ := exec.Command("brew", "upgrade", "richardyc/opencapy/opencapy").CombinedOutput()
+			upgraded := !strings.Contains(string(upgradeOut), "already installed")
+
+			if !upgraded {
 				binaryPath, _ := os.Executable()
 				ver, _ := exec.Command(binaryPath, "version").Output()
 				fmt.Printf("Already on the latest version. %s", ver)
 				return nil
 			}
 
-			fmt.Println("Upgrading opencapy via Homebrew…")
-			upgrade := exec.Command("brew", "upgrade", "opencapy")
-			upgrade.Stdout = os.Stdout
-			upgrade.Stderr = os.Stderr
-			if err := upgrade.Run(); err != nil {
-				return fmt.Errorf("brew upgrade: %w", err)
-			}
+			fmt.Println(strings.TrimSpace(string(upgradeOut)))
 
 			fmt.Println("\nRestarting daemon…")
 			home, _ := os.UserHomeDir()
@@ -166,9 +169,13 @@ func verifyDaemon() error {
 		if err == nil {
 			conn.Close()
 			fmt.Println(" ✔︎")
-			// Print new version from binary.
-			binaryPath, _ := os.Executable()
-			out, _ := exec.Command(binaryPath, "version").Output()
+			// Print version from the installed binary on disk (not this process,
+			// which may be the pre-upgrade binary still in memory).
+			newBin, err := exec.LookPath("opencapy")
+			if err != nil {
+				newBin, _ = os.Executable()
+			}
+			out, _ := exec.Command(newBin, "version").Output()
 			fmt.Printf("Running: %s", out)
 			return nil
 		}
