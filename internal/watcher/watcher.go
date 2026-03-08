@@ -16,12 +16,9 @@ type EventType string
 
 const (
 	EventApproval EventType = "approval"
-	EventThinking EventType = "thinking"
-	EventFileEdit EventType = "file_edit"
-	EventIdle     EventType = "idle"
 	EventCrash    EventType = "crash"
 	EventDone     EventType = "done"
-	EventInput    EventType = "input"
+	EventOutput   EventType = "output" // raw pane lines for live display
 )
 
 // Event represents a detected CC event in a tmux pane.
@@ -32,35 +29,18 @@ type Event struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-var patterns = map[EventType]*regexp.Regexp{
-	// Claude Code prompts approval with numbered options like "❯ 1. Yes" / "1 Yes"
-	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|\[y/n\]|❯\s*1\.?\s*yes|^\s*1\s+yes)`),
-	// Claude Code thinking spinner (✶) — distinct from tool-call lines (⏺)
-	EventThinking: regexp.MustCompile(`✶`),
-	// Claude Code shows Edit/Write/Create tool calls with a leading ⏺
-	EventFileEdit: regexp.MustCompile(`⏺\s+(Edit|Write|Create)\(`),
-	// Idle: shell prompt alone on a line (zsh ❯ or bash $)
-	EventIdle: regexp.MustCompile(`(?m)^❯\s*$`),
-	// Crash: language-specific crash indicators at line start, not general "error:"
-	EventCrash: regexp.MustCompile(`(?im)^\s*(Traceback \(most recent call last\)|panic:|fatal error:|FATAL ERROR:)`),
-	// Done: Claude Code's specific completion phrase
-	EventDone: regexp.MustCompile(`(?i)(task complete|claude code (is done|has finished|finished the task))`),
-	// Input: Claude Code user input line "❯ <text>" — non-empty prompt
-	EventInput: regexp.MustCompile(`(?m)^❯\s+\S.+`),
+// structuredPatterns are used only for push notifications and the approval popup.
+// Display is handled by raw EventOutput — no more brittle pattern-matching for UI.
+var structuredPatterns = map[EventType]*regexp.Regexp{
+	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|\[y/n\]|❯\s*1\.?\s*yes)`),
+	EventCrash:    regexp.MustCompile(`(?im)^\s*(Traceback \(most recent call last\)|panic:|fatal error:|FATAL ERROR:)`),
+	EventDone:     regexp.MustCompile(`(?i)task complete`),
 }
 
-// cooldowns defines per-event-type debounce durations.
-// Input events use a longer window to avoid re-firing the same command.
-var cooldowns = map[EventType]time.Duration{
-	EventInput: 10 * time.Second,
-}
+// toolCallPattern finds the ⏺ ToolName(...) line to show in approval context.
+var toolCallPattern = regexp.MustCompile(`⏺\s+\S`)
 
-// toolCallPattern matches Claude Code tool invocation lines like "⏺ Bash(...)" or "⏺ Edit(...)".
-var toolCallPattern = regexp.MustCompile(`⏺\s+\w[\w\s]*\(`)
-
-// extractApprovalContext scans the full pane output (top→bottom) and returns
-// the last tool-call line seen before the approval prompt. Falls back to a
-// generic message if no tool call is found.
+// extractApprovalContext returns the last tool-call line from a wider output window.
 func extractApprovalContext(output string) string {
 	lines := strings.Split(output, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -71,34 +51,19 @@ func extractApprovalContext(output string) string {
 	return "Claude Code needs approval"
 }
 
-// DetectEvents scans pane output and returns matched events.
+// DetectEvents scans pane output for structured events (approval/crash/done).
 func DetectEvents(sessionName, output string) []Event {
 	var events []Event
 	now := time.Now()
-
-	for eventType, pat := range patterns {
-		match := pat.FindString(output)
-		if match == "" {
-			continue
+	for eventType, pat := range structuredPatterns {
+		if match := pat.FindString(output); match != "" {
+			events = append(events, Event{
+				Type:      eventType,
+				Session:   sessionName,
+				Content:   match,
+				Timestamp: now,
+			})
 		}
-		content := match
-		if eventType == EventInput {
-			// Strip the leading "❯ " prompt marker to surface just the command text.
-			content = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(match), "❯"))
-			// Skip numbered approval option lines like "1. Yes", "2. No (safer…)"
-			if len(content) >= 2 && content[0] >= '0' && content[0] <= '9' && content[1] == '.' {
-				continue
-			}
-			if content == "" {
-				continue
-			}
-		}
-		events = append(events, Event{
-			Type:      eventType,
-			Session:   sessionName,
-			Content:   content,
-			Timestamp: now,
-		})
 	}
 	return events
 }
@@ -106,11 +71,11 @@ func DetectEvents(sessionName, output string) []Event {
 // Watcher polls all registered sessions and emits events.
 type Watcher struct {
 	mu        sync.RWMutex
-	sessions  map[string]string              // name -> project path
+	sessions  map[string]string
 	events    chan Event
 	interval  time.Duration
-	lastHash  map[string]uint64              // session -> hash of last pane output
-	lastEvent map[string]map[EventType]time.Time // session -> event type -> last emit time
+	lastHash  map[string]uint64
+	lastEvent map[string]map[EventType]time.Time
 }
 
 // New creates a new Watcher with the given poll interval.
@@ -157,7 +122,6 @@ func (w *Watcher) Events() <-chan Event {
 func (w *Watcher) Start(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -177,64 +141,74 @@ func (w *Watcher) poll() {
 	w.mu.RUnlock()
 
 	for _, name := range names {
-		// Capture 20 lines for hash (change detection), but only run pattern
-		// matching against the last 5 lines so we detect the *current* pane
-		// state and not historical output (e.g., code diffs shown by Claude Code).
 		output, err := tmux.CapturePaneOutput(name, 20)
 		if err != nil {
 			continue
 		}
 
-		// Compute content hash — skip if unchanged
+		// Skip if pane content unchanged.
 		h := fnv.New64a()
 		h.Write([]byte(output))
 		hash := h.Sum64()
-
 		w.mu.Lock()
 		if w.lastHash[name] == hash {
 			w.mu.Unlock()
-			continue // nothing changed
+			continue
 		}
 		w.lastHash[name] = hash
 		w.mu.Unlock()
 
-		// Only analyse the bottom 5 lines for current state detection.
+		// --- EventOutput: last 15 lines as a live pane snapshot, 1s cooldown ---
 		lines := strings.Split(output, "\n")
-		if len(lines) > 5 {
-			lines = lines[len(lines)-5:]
+		if len(lines) > 15 {
+			lines = lines[len(lines)-15:]
 		}
-		tail := strings.Join(lines, "\n")
+		w.tryEmit(name, Event{
+			Type:      EventOutput,
+			Session:   name,
+			Content:   strings.Join(lines, "\n"),
+			Timestamp: time.Now(),
+		}, 1*time.Second)
 
-		events := DetectEvents(name, tail)
-		// For approval events, enrich the content with the actual tool call
-		// from the broader pane context rather than just the regex match text.
-		for i, ev := range events {
+		// --- Structured events (approval/crash/done) for push + approval popup ---
+		// Only scan the bottom 5 lines to avoid false matches in historical output.
+		tail := strings.Join(lines[max(0, len(lines)-5):], "\n")
+		structured := DetectEvents(name, tail)
+
+		// Enrich approval with a wider context window to find the ⏺ tool call.
+		for i, ev := range structured {
 			if ev.Type == EventApproval {
-				events[i].Content = extractApprovalContext(output)
+				ctx50, _ := tmux.CapturePaneOutput(name, 50)
+				structured[i].Content = extractApprovalContext(ctx50)
 			}
 		}
-		for _, ev := range events {
-			// 2-second cooldown per (session, event type)
-			w.mu.Lock()
-			if w.lastEvent[name] == nil {
-				w.lastEvent[name] = make(map[EventType]time.Time)
-			}
-			cd := 2 * time.Second
-			if d, ok := cooldowns[ev.Type]; ok {
-				cd = d
-			}
-			if last, ok := w.lastEvent[name][ev.Type]; ok && time.Since(last) < cd {
-				w.mu.Unlock()
-				continue
-			}
-			w.lastEvent[name][ev.Type] = time.Now()
-			w.mu.Unlock()
-
-			select {
-			case w.events <- ev:
-			default:
-				// Channel full, drop oldest
-			}
+		for _, ev := range structured {
+			w.tryEmit(name, ev, 2*time.Second)
 		}
 	}
+}
+
+// tryEmit fires ev if the per-(session,type) cooldown has elapsed.
+func (w *Watcher) tryEmit(session string, ev Event, cooldown time.Duration) {
+	w.mu.Lock()
+	if w.lastEvent[session] == nil {
+		w.lastEvent[session] = make(map[EventType]time.Time)
+	}
+	if last, ok := w.lastEvent[session][ev.Type]; ok && time.Since(last) < cooldown {
+		w.mu.Unlock()
+		return
+	}
+	w.lastEvent[session][ev.Type] = time.Now()
+	w.mu.Unlock()
+	select {
+	case w.events <- ev:
+	default:
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
