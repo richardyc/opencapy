@@ -55,10 +55,11 @@ type InboundMessage struct {
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
 type SessionSnapshot struct {
-	Name        string    `json:"name"`
-	ProjectPath string    `json:"project_path"`
-	LastOutput  string    `json:"last_output"` // last 20 lines of pane
-	Timestamp   time.Time `json:"timestamp"`
+	Name         string          `json:"name"`
+	ProjectPath  string          `json:"project_path"`
+	LastOutput   string          `json:"last_output"` // last 20 lines of pane
+	Timestamp    time.Time       `json:"timestamp"`
+	RecentEvents []watcher.Event `json:"recent_events,omitempty"`
 }
 
 // Client represents a connected iOS device.
@@ -70,24 +71,27 @@ type Client struct {
 
 // Server is the WebSocket server that bridges watcher events to iOS.
 type Server struct {
-	port     int
-	clients  map[string]*Client
-	events   <-chan watcher.Event
-	registry *project.Registry
-	push     *push.Registry
-	ptyMgr   *ptymanager.Manager
-	mu       sync.RWMutex
+	port         int
+	clients      map[string]*Client
+	events       <-chan watcher.Event
+	registry     *project.Registry
+	push         *push.Registry
+	ptyMgr       *ptymanager.Manager
+	mu           sync.RWMutex
+	recentEvents map[string][]watcher.Event // last 50 non-output events per session
+	recentMu     sync.RWMutex
 }
 
 // New creates a new WebSocket server.
 func New(port int, events <-chan watcher.Event, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
 	return &Server{
-		port:     port,
-		clients:  make(map[string]*Client),
-		events:   events,
-		registry: reg,
-		push:     pushReg,
-		ptyMgr:   ptyMgr,
+		port:         port,
+		clients:      make(map[string]*Client),
+		events:       events,
+		registry:     reg,
+		push:         pushReg,
+		ptyMgr:       ptyMgr,
+		recentEvents: make(map[string][]watcher.Event),
 	}
 }
 
@@ -595,6 +599,16 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 				return
 			}
 
+			// Store non-output events for replay when a new client connects.
+			if ev.Type != watcher.EventOutput {
+				s.recentMu.Lock()
+				s.recentEvents[ev.Session] = append(s.recentEvents[ev.Session], ev)
+				if len(s.recentEvents[ev.Session]) > 50 {
+					s.recentEvents[ev.Session] = s.recentEvents[ev.Session][len(s.recentEvents[ev.Session])-50:]
+				}
+				s.recentMu.Unlock()
+			}
+
 			msg := OutboundMessage{
 				Type:    "event",
 				Payload: ev,
@@ -709,11 +723,16 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 			lines = lines[len(lines)-20:]
 		}
 
+		s.recentMu.RLock()
+		recent := append([]watcher.Event{}, s.recentEvents[sess.Name]...)
+		s.recentMu.RUnlock()
+
 		snapshots = append(snapshots, SessionSnapshot{
-			Name:        sess.Name,
-			ProjectPath: projectPath,
-			LastOutput:  strings.Join(lines, "\n"),
-			Timestamp:   now,
+			Name:         sess.Name,
+			ProjectPath:  projectPath,
+			LastOutput:   strings.Join(lines, "\n"),
+			Timestamp:    now,
+			RecentEvents: recent,
 		})
 	}
 
