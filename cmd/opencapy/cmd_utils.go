@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"time"
 
@@ -80,6 +81,53 @@ func newQRCmd() *cobra.Command {
 			fmt.Println(qr.ToSmallString(false))
 			fmt.Printf("  %s\n", url)
 			return nil
+		},
+	}
+}
+
+func newUpdateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "update",
+		Short: "Upgrade opencapy to the latest version and restart the daemon",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fmt.Println("Upgrading opencapy via Homebrew…")
+			upgrade := exec.Command("brew", "upgrade", "opencapy")
+			upgrade.Stdout = os.Stdout
+			upgrade.Stderr = os.Stderr
+			if err := upgrade.Run(); err != nil {
+				return fmt.Errorf("brew upgrade: %w", err)
+			}
+
+			fmt.Println("\nRestarting daemon…")
+			home, _ := os.UserHomeDir()
+			plistPath := home + "/Library/LaunchAgents/com.opencapy.daemon.plist"
+
+			if platform.IsMacOS() {
+				// Restart via launchctl if the plist is installed, otherwise signal.
+				if _, err := os.Stat(plistPath); err == nil {
+					exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
+					if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
+						return fmt.Errorf("launchctl load: %w", err)
+					}
+					fmt.Println("Daemon restarted via LaunchAgent. Done.")
+					return nil
+				}
+				// Not installed as service — just kill the running process so the user
+				// can start the new one themselves.
+				exec.Command("pkill", "-f", "opencapy daemon").Run() //nolint:errcheck
+				fmt.Println("Old daemon stopped. Run `opencapy daemon` (or set up autostart with `opencapy install`).")
+				return nil
+			}
+
+			if platform.IsLinux() {
+				if err := exec.Command("sudo", "systemctl", "restart", "opencapy").Run(); err != nil {
+					return fmt.Errorf("systemctl restart: %w", err)
+				}
+				fmt.Println("Daemon restarted via systemd. Done.")
+				return nil
+			}
+
+			return fmt.Errorf("unsupported platform — restart the daemon manually")
 		},
 	}
 }

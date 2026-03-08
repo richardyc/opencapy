@@ -21,6 +21,26 @@ type Session struct {
 // CapybaraColor is the opencapy brand status-bar color — warm capybara brown.
 const CapybaraColor = "#7B5B3A"
 
+// scrollConf contains tmux key bindings that reduce Magic Trackpad scroll sensitivity.
+// Default tmux scrolls 5 lines per wheel event; this reduces it to 1.
+// The mouse_any_flag check ensures app-level mouse events (e.g. Claude Code TUI) are
+// still forwarded correctly instead of being intercepted by copy mode.
+const scrollConf = `bind -T copy-mode WheelUpPane   send-keys -X -N 1 scroll-up
+bind -T copy-mode WheelDownPane send-keys -X -N 1 scroll-down
+bind -n WheelUpPane   if -Ft= '#{mouse_any_flag}' 'send-keys -M' 'if -Ft= "#{pane_in_mode}" "send-keys -X -N 1 scroll-up" "copy-mode -et="'
+bind -n WheelDownPane if -Ft= '#{mouse_any_flag}' 'send-keys -M' 'if -Ft= "#{pane_in_mode}" "send-keys -X -N 1 scroll-down" "send-keys -M"'
+`
+
+// ApplyScrollConfig writes the scroll sensitivity config to a temp file and sources it
+// into the running tmux server. Safe to call multiple times (idempotent bindings).
+func ApplyScrollConfig() {
+	path := os.TempDir() + "/.opencapy-scroll.conf"
+	if err := os.WriteFile(path, []byte(scrollConf), 0o644); err != nil {
+		return
+	}
+	_ = exec.Command("tmux", "source-file", path).Run()
+}
+
 // NewSession creates a new detached tmux session with the opencapy capybara status bar.
 func NewSession(name, cwd string) error {
 	cmd := exec.Command("tmux", "new-session", "-d", "-s", name, "-c", cwd)

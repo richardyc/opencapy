@@ -32,6 +32,7 @@ func main() {
 		newDaemonCmd(),
 		newQRCmd(),
 		newInstallCmd(),
+		newUpdateCmd(),
 		&cobra.Command{
 			Use:   "version",
 			Short: "Print version info",

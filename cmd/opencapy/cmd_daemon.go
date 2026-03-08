@@ -76,6 +76,9 @@ func newDaemonCmd() *cobra.Command {
 
 			go w.Start(ctx)
 
+			// Apply tmux scroll bindings (1 line/event vs default 5, Magic Trackpad fix)
+			tmux.ApplyScrollConfig()
+
 			// Load push registry
 			pushReg, pushErr := push.Load(filepath.Join(os.Getenv("HOME"), ".opencapy"))
 			if pushErr != nil {
