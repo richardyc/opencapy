@@ -61,7 +61,8 @@ type SessionSnapshot struct {
 	Name         string          `json:"name"`
 	ProjectPath  string          `json:"project_path"`
 	LastOutput   string          `json:"last_output"` // last 20 lines of pane
-	Timestamp    time.Time       `json:"timestamp"`
+	Created      time.Time       `json:"created"`
+	LastActive   time.Time       `json:"last_active"`
 	RecentEvents []watcher.Event `json:"recent_events,omitempty"`
 }
 
@@ -814,7 +815,6 @@ func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
 // snapshotSessions builds a snapshot of all currently-registered sessions.
 func (s *Server) snapshotSessions() []SessionSnapshot {
 	var snapshots []SessionSnapshot
-	now := time.Now()
 
 	sessions, err := tmux.ListSessions()
 	if err != nil {
@@ -844,7 +844,8 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 			Name:         sess.Name,
 			ProjectPath:  projectPath,
 			LastOutput:   strings.Join(lines, "\n"),
-			Timestamp:    now,
+			Created:      sess.Created,
+			LastActive:   sess.LastActive,
 			RecentEvents: recent,
 		})
 	}
