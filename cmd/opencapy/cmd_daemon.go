@@ -145,7 +145,9 @@ func newDaemonCmd() *cobra.Command {
 				}()
 			}
 
-			// Hot-reload: watch sessions.json every 2s, add new sessions dynamically.
+			// Session reconciler: every 2 s, diff live tmux sessions against the
+			// registry.  Adds sessions created on Mac, removes sessions killed on Mac,
+			// and broadcasts a snapshot to iOS whenever anything changed.
 			go func() {
 				ticker := time.NewTicker(2 * time.Second)
 				defer ticker.Stop()
@@ -154,22 +156,48 @@ func newDaemonCmd() *cobra.Command {
 					case <-ctx.Done():
 						return
 					case <-ticker.C:
-						fresh, err := project.Load()
+						live, err := tmux.ListSessions()
 						if err != nil {
 							continue
 						}
-						for name, path := range fresh.All() {
+						liveMap := make(map[string]string, len(live))
+						for _, s := range live {
+							liveMap[s.Name] = s.Cwd
+						}
+
+						changed := false
+
+						// Add sessions that exist in tmux but not in the registry/watcher.
+						for name, cwd := range liveMap {
 							if !w.HasSession(name) {
-								w.AddSession(name, path)
+								w.AddSession(name, cwd)
 								if fw != nil {
-									_ = fw.AddProject(path)
+									_ = fw.AddProject(cwd)
 								}
 								if reg != nil {
-									_ = reg.Register(name, path)
+									_ = reg.Register(name, cwd)
+									_ = reg.Save()
 								}
-								// Notify connected iOS clients of the new session.
-								srv.BroadcastSnapshot()
+								changed = true
 							}
+						}
+
+						// Remove sessions that are in the registry but no longer in tmux.
+						if reg != nil {
+							for name := range reg.All() {
+								if _, alive := liveMap[name]; !alive {
+									w.RemoveSession(name)
+									_ = reg.Unregister(name)
+									changed = true
+								}
+							}
+							if changed {
+								_ = reg.Save()
+							}
+						}
+
+						if changed {
+							srv.BroadcastSnapshot()
 						}
 					}
 				}

@@ -345,6 +345,24 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			_ = tmux.SendKeys(msg.Session, msg.Keys)
 		}
 
+	case "kill_session":
+		if msg.Session != "" {
+			// Close any open PTY for this session before killing it.
+			if s.ptyMgr != nil {
+				s.ptyMgr.Close(msg.Session)
+			}
+			if err := tmux.KillSession(msg.Session); err != nil {
+				log.Printf("kill_session %q: %v", msg.Session, err)
+			}
+			// Unregister from the project registry so it doesn't reappear.
+			if s.registry != nil {
+				_ = s.registry.Unregister(msg.Session)
+				_ = s.registry.Save()
+			}
+			// Broadcast updated session list immediately.
+			go s.BroadcastSnapshot()
+		}
+
 	case "register_push":
 		if msg.Token != "" && s.push != nil {
 			_ = s.push.Register(msg.Token, client.ID)
