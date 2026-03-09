@@ -2,7 +2,7 @@
 
 **Your machines, mirrored. Code from anywhere.**
 
-OpenCapy is a lightweight daemon + iOS app that lets you monitor and control Claude Code sessions from your iPhone. Claude Code runs on your Mac or Linux VM. You watch it, approve prompts, browse changed files, and drop into a terminal — all from your phone.
+OpenCapy is a lightweight daemon + iOS app that lets you monitor and control Claude Code sessions from your iPhone. Claude Code runs on your Mac or Linux VM. You watch it, approve prompts, browse changed files, and drop into a full interactive terminal — all from your phone.
 
 ## Install
 
@@ -27,7 +27,7 @@ sudo opencapy install   # installs systemd service
 ```bash
 # 1. Start a session (daemon auto-starts if not running)
 cd ~/myproject
-opencapy              # name defaults to current directory
+opencapy              # opens full-screen TUI session chooser
 
 # 2. Inside the session, run Claude Code
 claude
@@ -43,22 +43,25 @@ The iOS app connects via Tailscale (Mac) or SSH tunnel (Linux/VPS). Sessions app
 Download on the App Store or TestFlight. Source: [richardyc/opencapy-ios](https://github.com/richardyc/opencapy-ios)
 
 **Features:**
-- Real-time terminal mirror with full ANSI color rendering
+- Real-time interactive terminal (PTY) with full ANSI color and Unicode rendering
 - Approve/deny Claude Code prompts with one tap
 - File browser and editor — browse, view diffs, and edit files directly
-- Full interactive terminal (PTY) for running commands
+- Git source control — stage/unstage, commit, view diffs
 - Event timeline — approval prompts, task completion, crashes
+- Voice input — on-device speech recognition, no API key needed
 - Push notifications and lock screen Live Activities when app is backgrounded
+- Create and delete sessions from iOS
 - Connects via Tailscale (zero-config on Mac) or SSH tunnel (Linux/VPS)
 
 ## CLI reference
 
 ```bash
-opencapy                    # interactive session chooser (fzf or numbered list)
-opencapy [name]             # new session with name (or cwd basename if omitted)
+opencapy                    # full-screen TUI session chooser (↑↓ navigate, Enter attach, d kill, n new)
+opencapy [name]             # attach to named session (error if not found; use 'new' to create)
+opencapy new [name]         # create new session (name defaults to cwd basename)
 opencapy attach [name]      # reattach to existing session
 opencapy here               # new session per terminal tab (for VSCode/Cursor profiles)
-opencapy ls                 # list all registered sessions
+opencapy ls                 # same as opencapy — full-screen TUI
 opencapy kill [name]        # kill a session
 opencapy approve [name]     # send approval keystroke (y + Enter)
 opencapy deny [name]        # send deny keystroke (n + Enter)
@@ -73,15 +76,15 @@ opencapy version            # print version + build info
 
 ## How it works
 
-1. `opencapy [name]` creates a tmux session with a capybara brown status bar and registers it in `~/.opencapy/sessions.json`
-2. The daemon polls every 500ms via `tmux capture-pane`, detecting Claude Code events by regex:
+1. `opencapy new` creates a tmux session with a capybara brown status bar and registers it in `~/.opencapy/sessions.json`
+2. The daemon reconciles live tmux sessions every 2s — sessions created or killed on Mac appear/disappear on iOS automatically
+3. The daemon polls every 500ms via `tmux capture-pane`, detecting Claude Code events by regex:
    - **Approval:** matches `do you want to proceed`, `[y/n]`, `❯ 1. yes`
    - **Crash:** matches `Traceback`, `panic:`, `fatal error:`
    - **Done:** matches `task complete`
-3. Events stream to the iOS app over WebSocket (port 7242), along with live pane output (last 15 lines, 1s cooldown)
-4. For approval events, the daemon scans a wider 50-line window to extract the `⏺ ToolName(...)` context shown in the iOS prompt card
-5. New sessions are hot-reloaded every 2s — no daemon restart required
-6. All tmux sessions (including those created outside opencapy) are auto-registered at daemon startup
+4. Events stream to the iOS app over WebSocket (port 7242), along with live pane output (last 15 lines, 1s cooldown)
+5. For approval events, the daemon scans a wider 50-line window to extract the `⏺ ToolName(...)` context shown in the iOS prompt card
+6. PTY mode uses `tmux new-session -s ocpy_<name> -t <name>` (a grouped session) so the iOS terminal has independent sizing without affecting the Mac terminal
 7. When the iOS app is backgrounded, push notifications are delivered via APNs
 
 ## iOS connectivity
@@ -99,8 +102,8 @@ The daemon exposes a WebSocket server on port 7242.
 ### Daemon → iOS
 | Message type | Description |
 |---|---|
-| `snapshot` | Full session list on connect (name, projectPath, lastOutput, recentEvents) |
-| `event` | Claude Code event (approval/thinking/file_edit/crash/done) |
+| `snapshot` | Full session list on connect (name, projectPath, lastOutput, created, lastActive, recentEvents) |
+| `event` | Claude Code event (approval/thinking/file_edit/crash/done/output) |
 | `file_event` | File changed by Claude Code (path, content, deleted flag) |
 | `file_tree` | Directory tree response (depth 3, excludes .git, node_modules, *.key, *.pem) |
 | `file_content` | File read response (path, content base64, size — max 1MB) |
@@ -117,13 +120,15 @@ The daemon exposes a WebSocket server on port 7242.
 | `approve` | Send approval keystroke to session |
 | `deny` | Send deny keystroke to session |
 | `send_keys` | Send arbitrary keys to session |
+| `kill_session` | Kill a tmux session and unregister it |
+| `refresh_sessions` | Request a fresh snapshot (e.g. on session list appear) |
 | `register_push` | Register APNs device token |
-| `new_session` | Create session (mode: "chat" launches claude, "terminal" opens shell) |
+| `new_session` | Create session (mode: "terminal" opens shell) |
 | `list_dir` | Request directory tree for a path |
 | `file_read` | Request file content |
 | `file_write` | Write file content (base64) |
 | `capture_pane` | Fetch pane scrollback history |
-| `open_pty` | Open a PTY for raw terminal access |
+| `open_pty` | Open a PTY for raw terminal access (uses grouped tmux session) |
 | `pty_input` | Send bytes to PTY (base64) |
 | `pty_resize` | Resize PTY (cols/rows) |
 | `close_pty` | Close PTY |
@@ -170,8 +175,6 @@ Notifications are only sent when no iOS clients are connected (i.e. app is backg
 ## Building a client
 
 OpenCapy is an open protocol — anyone can build a client that connects to the daemon. The WebSocket message format is documented in the [WebSocket protocol](#websocket-protocol) section above.
-
-> **TODO:** publish a formal `PROTOCOL.md` once the protocol stabilizes.
 
 ## License
 
