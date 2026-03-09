@@ -78,6 +78,7 @@ type Server struct {
 	port         int
 	clients      map[string]*Client
 	events       <-chan watcher.Event
+	sessionWatch *watcher.Watcher
 	registry     *project.Registry
 	push         *push.Registry
 	ptyMgr       *ptymanager.Manager
@@ -87,11 +88,12 @@ type Server struct {
 }
 
 // New creates a new WebSocket server.
-func New(port int, events <-chan watcher.Event, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
+func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
 	return &Server{
 		port:         port,
 		clients:      make(map[string]*Client),
-		events:       events,
+		events:       w.Events(),
+		sessionWatch: w,
 		registry:     reg,
 		push:         pushReg,
 		ptyMgr:       ptyMgr,
@@ -348,12 +350,19 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	case "kill_session":
 		if msg.Session != "" {
+			log.Printf("kill_session: killing %q", msg.Session)
 			// Close any open PTY for this session before killing it.
 			if s.ptyMgr != nil {
 				s.ptyMgr.Close(msg.Session)
 			}
 			if err := tmux.KillSession(msg.Session); err != nil {
-				log.Printf("kill_session %q: %v", msg.Session, err)
+				log.Printf("kill_session %q: tmux error: %v", msg.Session, err)
+			} else {
+				log.Printf("kill_session %q: done", msg.Session)
+			}
+			// Stop the watcher from polling a dead session.
+			if s.sessionWatch != nil {
+				s.sessionWatch.RemoveSession(msg.Session)
 			}
 			// Unregister from the project registry so it doesn't reappear.
 			if s.registry != nil {

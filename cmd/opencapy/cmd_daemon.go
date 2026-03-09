@@ -101,7 +101,7 @@ func newDaemonCmd() *cobra.Command {
 			ptyMgr := ptymanager.NewManager()
 
 			// Start WebSocket server
-			srv := ws.New(cfg.Port, w.Events(), reg, pushReg, ptyMgr)
+			srv := ws.New(cfg.Port, w, reg, pushReg, ptyMgr)
 
 			// Forward PTY output events to the owning WebSocket client only
 			go func() {
