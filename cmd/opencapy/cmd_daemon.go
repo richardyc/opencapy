@@ -49,12 +49,17 @@ func newDaemonCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "warning: could not load registry: %v\n", err)
 			}
 
-			// Reconcile registry against live tmux sessions
+			// Reconcile registry against live tmux sessions.
+			// Also auto-register any tmux session not yet in the registry (using its Cwd)
+			// so that file browsing works for sessions started outside of opencapy.
 			liveSessions, lsErr := tmux.ListSessions()
 			if lsErr == nil && reg != nil {
 				liveNames := make(map[string]bool)
 				for _, s := range liveSessions {
 					liveNames[s.Name] = true
+					if _, ok := reg.GetProject(s.Name); !ok && s.Cwd != "" {
+						_ = reg.Register(s.Name, s.Cwd)
+					}
 				}
 				for name := range reg.All() {
 					if !liveNames[name] {
