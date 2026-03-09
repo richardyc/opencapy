@@ -43,10 +43,11 @@ func tmuxPath() string {
 
 // Session represents a tmux session.
 type Session struct {
-	Name    string
-	Cwd     string
-	Windows int
-	Created time.Time
+	Name       string
+	Cwd        string
+	Windows    int
+	Created    time.Time
+	LastActive time.Time
 }
 
 // CapybaraColor is the opencapy brand status-bar color — warm capybara brown.
@@ -91,7 +92,7 @@ func NewSession(name, cwd string) error {
 func ListSessions() ([]Session, error) {
 	const sep = "|"
 	cmd := exec.Command(tmuxPath(), "list-sessions", "-F",
-		"#{session_name}"+sep+"#{session_path}"+sep+"#{session_windows}"+sep+"#{session_created}")
+		"#{session_name}"+sep+"#{session_path}"+sep+"#{session_windows}"+sep+"#{session_created}"+sep+"#{session_activity}")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		// tmux exits 1 when no server is running — treat as empty list, not error.
@@ -106,19 +107,21 @@ func ListSessions() ([]Session, error) {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, sep, 4)
-		if len(parts) < 4 {
+		parts := strings.SplitN(line, sep, 5)
+		if len(parts) < 5 {
 			continue
 		}
 
 		windows, _ := strconv.Atoi(parts[2])
 		created, _ := strconv.ParseInt(parts[3], 10, 64)
+		activity, _ := strconv.ParseInt(parts[4], 10, 64)
 
 		sessions = append(sessions, Session{
-			Name:    parts[0],
-			Cwd:     parts[1],
-			Windows: windows,
-			Created: time.Unix(created, 0),
+			Name:       parts[0],
+			Cwd:        parts[1],
+			Windows:    windows,
+			Created:    time.Unix(created, 0),
+			LastActive: time.Unix(activity, 0),
 		})
 	}
 	return sessions, nil
@@ -132,9 +135,13 @@ func KillSession(name string) error {
 }
 
 // Attach attaches to an existing tmux session.
-// This replaces the current process with tmux attach.
+// If already inside tmux ($TMUX is set), uses switch-client to avoid nesting.
+// This replaces the current process with tmux.
 func Attach(name string) error {
 	bin := tmuxPath()
+	if os.Getenv("TMUX") != "" {
+		return syscall.Exec(bin, []string{bin, "switch-client", "-t", name}, os.Environ())
+	}
 	return syscall.Exec(bin, []string{bin, "attach-session", "-t", name}, os.Environ())
 }
 

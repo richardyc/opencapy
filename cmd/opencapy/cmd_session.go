@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/richardyc/opencapy/internal/config"
@@ -52,8 +50,8 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(args) == 0 {
-		// No args → interactive chooser. Includes a "new session here" option.
-		return runChooser(cwd)
+		// No args → full-screen TUI session manager.
+		return runTUI(cwd)
 	}
 
 	// Explicit name → attach ONLY. Typos fail loudly; use 'opencapy new' to create.
@@ -69,20 +67,6 @@ func runRoot(cmd *cobra.Command, args []string) error {
 	return tmux.Attach(name)
 }
 
-// runChooser shows the interactive session picker and handles creation.
-// The special "[+] new" entry creates a session named after cwd.
-func runChooser(cwd string) error {
-	sessions, _ := tmux.ListSessions()
-	reg, _ := project.Load()
-
-	// fzf path
-	if _, err := exec.LookPath("fzf"); err == nil {
-		return fzfChooser(sessions, reg, cwd)
-	}
-	// Fallback: numbered list
-	return numberedChooser(sessions, reg, cwd)
-}
-
 // createSession creates and registers a new session, then attaches.
 func createSession(name, cwd string) error {
 	if err := tmux.NewSession(name, cwd); err != nil {
@@ -96,93 +80,6 @@ func createSession(name, cwd string) error {
 	}
 	fmt.Printf("Created session %q (%s)\n", name, cwd)
 	return tmux.Attach(name)
-}
-
-// newTag is the sentinel value used in the chooser to represent "create new session".
-const newTag = "\x00new"
-
-// fzfChooser shows a fzf menu with a "[+] new" option at the top.
-func fzfChooser(sessions []tmux.Session, reg *project.Registry, cwd string) error {
-	cwdName := filepath.Base(cwd)
-
-	var sb strings.Builder
-	// "New session" entry first — tab-separated so field {1} is the sentinel.
-	fmt.Fprintf(&sb, "%s\t[+] new  %s  (%s)\n", newTag, cwdName, cwd)
-	for _, s := range sessions {
-		path := s.Cwd
-		if reg != nil {
-			if p, ok := reg.GetProject(s.Name); ok {
-				path = p
-			}
-		}
-		fmt.Fprintf(&sb, "%s\t%s  %s\n", s.Name, s.Name, path)
-	}
-
-	fzf := exec.Command("fzf",
-		"--height=40%", "--reverse", "--no-multi",
-		"--prompt=opencapy > ",
-		"--header=Enter: attach/new   Ctrl-C: cancel",
-		"--delimiter=\t",
-		"--with-nth=2", // show only the display column
-	)
-	fzf.Stdin = strings.NewReader(sb.String())
-	fzf.Stderr = os.Stderr
-
-	out, err := fzf.Output()
-	if err != nil {
-		return nil // cancelled
-	}
-
-	// The output is the display column; we need the key (first field of original input).
-	// fzf's --with-nth hides the first field but output is still the full original line.
-	line := strings.TrimSpace(string(out))
-	if line == "" {
-		return nil
-	}
-	key := strings.SplitN(line, "\t", 2)[0]
-
-	if key == newTag {
-		return createSession(cwdName, cwd)
-	}
-	return tmux.Attach(key)
-}
-
-// numberedChooser shows a numbered list with "[n]ew" option at the top.
-func numberedChooser(sessions []tmux.Session, reg *project.Registry, cwd string) error {
-	cwdName := filepath.Base(cwd)
-
-	fmt.Printf("  [n] new   Create session %q (%s)\n", cwdName, cwd)
-	for i, s := range sessions {
-		path := s.Cwd
-		if reg != nil {
-			if p, ok := reg.GetProject(s.Name); ok {
-				path = p
-			}
-		}
-		fmt.Printf("  [%d] %-20s  %s\n", i+1, s.Name, path)
-	}
-	fmt.Print("\nChoice (n=new, number, or session name): ")
-
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		return nil
-	}
-	input := strings.TrimSpace(scanner.Text())
-	if input == "" || input == "q" {
-		return nil
-	}
-	if input == "n" || input == "new" {
-		return createSession(cwdName, cwd)
-	}
-	if idx, err := strconv.Atoi(input); err == nil && idx >= 1 && idx <= len(sessions) {
-		return tmux.Attach(sessions[idx-1].Name)
-	}
-	for _, s := range sessions {
-		if s.Name == input {
-			return tmux.Attach(s.Name)
-		}
-	}
-	return fmt.Errorf("session %q not found", input)
 }
 
 // newHereCmd is the non-interactive create command used in editor terminal profiles
@@ -225,7 +122,7 @@ func newLsCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("get working directory: %w", err)
 			}
-			return runChooser(cwd)
+			return runTUI(cwd)
 		},
 	}
 }
