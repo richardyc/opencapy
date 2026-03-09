@@ -86,7 +86,15 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 	// window group of <target>.  The group session has its own terminal size
 	// and client list, so attaching iOS here never resizes the Mac client.
 	cmd := exec.Command(tmuxBin(), "new-session", "-s", groupName, "-t", sessionName)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	// Ensure UTF-8 locale so tmux treats this PTY client as a Unicode terminal.
+	// Without LANG/LC_CTYPE the LaunchAgent environment has no locale set, which
+	// makes tmux fall back to ASCII mode and substitute _ for multi-byte characters.
+	cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
+		"LC_CTYPE=en_US.UTF-8",
+	)
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
 		Cols: uint16(cols),
 		Rows: uint16(rows),
