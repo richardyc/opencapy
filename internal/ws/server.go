@@ -46,6 +46,9 @@ type InboundMessage struct {
 	// File fields
 	Path    string `json:"path,omitempty"`
 	Content string `json:"content,omitempty"` // base64 for file_write
+	// Git fields
+	Message string `json:"message,omitempty"`
+	Staged  bool   `json:"staged,omitempty"`
 	// Session creation fields
 	Mode        string `json:"mode,omitempty"`         // "chat" or "terminal"
 	ProjectPath string `json:"project_path,omitempty"` // working directory for new session
@@ -183,14 +186,19 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// isPathAllowed checks whether path falls within one of the registered project paths.
+// isPathAllowed checks whether path falls within one of the registered project paths,
+// or within /tmp (always allowed for temporary file uploads).
 // This prevents path traversal attacks on file_read, file_write, and list_dir.
 func isPathAllowed(path string, reg *project.Registry) bool {
-	if reg == nil {
-		return false
-	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
+		return false
+	}
+	// /tmp is always safe for temporary uploads (images, etc.)
+	if abs == "/tmp" || strings.HasPrefix(abs, "/tmp/") {
+		return true
+	}
+	if reg == nil {
 		return false
 	}
 	for _, projectPath := range reg.AllProjects() {
@@ -492,6 +500,87 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	case "new_session":
 		s.handleNewSession(client, msg)
+
+	// ── Git messages ──────────────────────────────────────────────────────────
+
+	case "git_status":
+		projectPath, ok := s.registry.GetProject(msg.Session)
+		if !ok || projectPath == "" {
+			break
+		}
+		result := parseGitStatus(projectPath)
+		result.Session = msg.Session
+		data, _ := json.Marshal(OutboundMessage{Type: "git_status_result", Payload: result})
+		select {
+		case client.send <- data:
+		default:
+		}
+
+	case "git_stage":
+		if msg.Path == "" {
+			break
+		}
+		projectPath, ok := s.registry.GetProject(msg.Session)
+		if !ok || projectPath == "" {
+			break
+		}
+		runGit(projectPath, "add", "--", msg.Path) //nolint:errcheck
+		result := parseGitStatus(projectPath)
+		result.Session = msg.Session
+		data, _ := json.Marshal(OutboundMessage{Type: "git_status_result", Payload: result})
+		select {
+		case client.send <- data:
+		default:
+		}
+
+	case "git_unstage":
+		if msg.Path == "" {
+			break
+		}
+		projectPath, ok := s.registry.GetProject(msg.Session)
+		if !ok || projectPath == "" {
+			break
+		}
+		runGit(projectPath, "restore", "--staged", "--", msg.Path) //nolint:errcheck
+		result := parseGitStatus(projectPath)
+		result.Session = msg.Session
+		data, _ := json.Marshal(OutboundMessage{Type: "git_status_result", Payload: result})
+		select {
+		case client.send <- data:
+		default:
+		}
+
+	case "git_commit":
+		if msg.Message == "" {
+			break
+		}
+		projectPath, ok := s.registry.GetProject(msg.Session)
+		if !ok || projectPath == "" {
+			break
+		}
+		runGit(projectPath, "commit", "-m", msg.Message) //nolint:errcheck
+		result := parseGitStatus(projectPath)
+		result.Session = msg.Session
+		data, _ := json.Marshal(OutboundMessage{Type: "git_status_result", Payload: result})
+		select {
+		case client.send <- data:
+		default:
+		}
+
+	case "git_diff":
+		if msg.Path == "" {
+			break
+		}
+		projectPath, ok := s.registry.GetProject(msg.Session)
+		if !ok || projectPath == "" {
+			break
+		}
+		result := gitDiff(projectPath, msg.Path, msg.Staged)
+		data, _ := json.Marshal(OutboundMessage{Type: "git_diff_result", Payload: result})
+		select {
+		case client.send <- data:
+		default:
+		}
 
 	case "file_write":
 		if msg.Path == "" || msg.Content == "" {
