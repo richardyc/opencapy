@@ -566,6 +566,12 @@ func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
 		return
 	}
 
+	// Register so isPathAllowed passes for file browsing.
+	if s.registry != nil {
+		_ = s.registry.Register(name, cwd)
+		_ = s.registry.Save()
+	}
+
 	// For chat mode, launch the AI assistant after a brief shell init delay.
 	if msg.Mode == "chat" {
 		time.Sleep(300 * time.Millisecond)
