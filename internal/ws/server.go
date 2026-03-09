@@ -333,6 +333,21 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		default:
 		}
 
+	case "refresh_sessions":
+		// Client is requesting a fresh snapshot (e.g. returning to session list).
+		go func() {
+			snapshots := s.snapshotSessions()
+			msg := OutboundMessage{Type: "snapshot", Payload: snapshots}
+			data, err := json.Marshal(msg)
+			if err != nil {
+				return
+			}
+			select {
+			case client.send <- data:
+			default:
+			}
+		}()
+
 	case "approve":
 		if msg.Session != "" {
 			_ = tmux.SendKeys(msg.Session, "y")
