@@ -34,6 +34,7 @@ type PTYOutput struct {
 // PTYSession holds a single active PTY session.
 type PTYSession struct {
 	sessionName string
+	groupName   string // grouped tmux session name; cleaned up on close
 	ptmx        *os.File
 	cmd         *exec.Cmd
 	clientID    string // who opened this PTY
@@ -59,7 +60,14 @@ func (m *Manager) Events() <-chan PTYOutput {
 	return m.events
 }
 
-// Open spawns `tmux attach-session -t <sessionName>` inside a PTY.
+// Open spawns a grouped tmux session mirroring sessionName inside a PTY.
+//
+// Using "new-session -s group -t target" instead of "attach-session" gives each
+// iOS client its own independent terminal size while sharing the window group.
+// This means the Mac user's terminal dimensions are never affected by the iOS
+// connection, and changes on the Mac (keystrokes, program output) are reflected
+// in real-time via the shared window group.
+//
 // clientID identifies which WebSocket client owns this PTY session.
 func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 	m.mu.Lock()
@@ -69,7 +77,15 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 		return fmt.Errorf("pty session %q already open", sessionName)
 	}
 
-	cmd := exec.Command(tmuxBin(), "attach-session", "-t", sessionName)
+	// Derive a unique grouped-session name for this connection.
+	groupName := "ocpy_" + sessionName
+	// Kill any stale grouped session from a previous connection (idempotent).
+	_ = exec.Command(tmuxBin(), "kill-session", "-t", groupName).Run()
+
+	// new-session -s <group> -t <target>: creates a session that shares the
+	// window group of <target>.  The group session has its own terminal size
+	// and client list, so attaching iOS here never resizes the Mac client.
+	cmd := exec.Command(tmuxBin(), "new-session", "-s", groupName, "-t", sessionName)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
 		Cols: uint16(cols),
@@ -81,6 +97,7 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 
 	sess := &PTYSession{
 		sessionName: sessionName,
+		groupName:   groupName,
 		ptmx:        ptmx,
 		cmd:         cmd,
 		clientID:    clientID,
@@ -108,9 +125,10 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 				break
 			}
 		}
-		// Clean up on natural exit: reap the process and close the pty fd.
+		// Clean up on natural exit.
 		_ = sess.cmd.Wait()
 		_ = sess.ptmx.Close()
+		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
 		m.mu.Lock()
 		delete(m.sessions, sessionName)
 		m.mu.Unlock()
@@ -158,11 +176,14 @@ func (m *Manager) Close(sessionName string) {
 		return
 	}
 
-	sess.ptmx.Close()
+	// Closing ptmx causes the read goroutine's Read() to return an error,
+	// which breaks the loop and triggers goroutine-side cleanup.
+	_ = sess.ptmx.Close()
 	if sess.cmd.Process != nil {
 		sess.cmd.Process.Kill()
 	}
-	sess.cmd.Wait() //nolint:errcheck
+	// Kill the grouped session so it doesn't linger after disconnect.
+	_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
 }
 
 // CloseByClient closes and removes all PTY sessions owned by the given clientID.
@@ -183,10 +204,10 @@ func (m *Manager) CloseByClient(clientID string) {
 	m.mu.Unlock()
 
 	for _, sess := range toClose {
-		sess.ptmx.Close()
+		_ = sess.ptmx.Close()
 		if sess.cmd.Process != nil {
 			sess.cmd.Process.Kill()
 		}
-		sess.cmd.Wait() //nolint:errcheck
+		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
 	}
 }
