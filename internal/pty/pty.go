@@ -140,13 +140,20 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir st
 				break
 			}
 		}
-		// Clean up on natural exit.
+		// Clean up on natural exit — but only if this goroutine's session is
+		// still the active one.  If Close() was already called and a new Open()
+		// replaced it, skip cleanup to avoid killing the new grouped session.
 		_ = sess.cmd.Wait()
 		_ = sess.ptmx.Close()
-		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
 		m.mu.Lock()
-		delete(m.sessions, sessionName)
+		isCurrent := m.sessions[sessionName] == sess
+		if isCurrent {
+			delete(m.sessions, sessionName)
+		}
 		m.mu.Unlock()
+		if isCurrent {
+			_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
+		}
 	}()
 
 	return nil
