@@ -45,12 +45,15 @@ Download on the App Store or TestFlight. Source: [richardyc/opencapy-ios](https:
 **Features:**
 - Real-time interactive terminal (PTY) with full ANSI color and Unicode rendering
 - Approve/deny Claude Code prompts with one tap
+- Native image paste — pick a photo on iOS, it appears inline in Claude Code via clipboard (no file path, no confirmation dialog)
 - File browser and editor — browse, view diffs, and edit files directly
 - Git source control — stage/unstage, commit, view diffs
 - Event timeline — approval prompts, task completion, crashes
 - Voice input — on-device speech recognition, no API key needed
 - Push notifications and lock screen Live Activities when app is backgrounded
+- Session list with live status indicators (pulsing green for active, solid green for recently active)
 - Create and delete sessions from iOS
+- Auto-reconnects when network/VPN comes back
 - Connects via Tailscale (zero-config on Mac) or SSH tunnel (Linux/VPS)
 
 ## CLI reference
@@ -85,7 +88,8 @@ opencapy version            # print version + build info
 4. Events stream to the iOS app over WebSocket (port 7242), along with live pane output (last 15 lines, 1s cooldown)
 5. For approval events, the daemon scans a wider 50-line window to extract the `⏺ ToolName(...)` context shown in the iOS prompt card
 6. PTY mode uses `tmux new-session -s ocpy_<name> -t <name>` (a grouped session) so the iOS terminal has independent sizing without affecting the Mac terminal
-7. When the iOS app is backgrounded, push notifications are delivered via APNs
+7. Native image paste: iOS sends PNG bytes → daemon writes to `/tmp`, sets Mac clipboard via `osascript`, sends `C-v` to the tmux session → Claude Code pastes the image inline
+8. When the iOS app is backgrounded, push notifications are delivered via APNs
 
 ## iOS connectivity
 
@@ -111,6 +115,7 @@ The daemon exposes a WebSocket server on port 7242.
 | `pane_content` | Scrollback history capture (300 lines by default) |
 | `pty_output` | Raw terminal bytes (base64, sent only to owning client) |
 | `session_created` | New session created via iOS request |
+| `image_pasted` | Clipboard set and C-v sent; iOS should show context compose bar |
 | `pong` | Heartbeat response |
 | `error` | Error message |
 
@@ -119,9 +124,10 @@ The daemon exposes a WebSocket server on port 7242.
 |---|---|
 | `approve` | Send approval keystroke to session |
 | `deny` | Send deny keystroke to session |
-| `send_keys` | Send arbitrary keys to session |
+| `send_keys` | Send arbitrary keys to session (tmux send-keys, appends Enter) |
 | `kill_session` | Kill a tmux session and unregister it |
-| `refresh_sessions` | Request a fresh snapshot (e.g. on session list appear) |
+| `refresh_sessions` | Request a fresh snapshot (sent to requesting client only) |
+| `paste_image` | PNG bytes (base64); daemon sets Mac clipboard + sends C-v to session |
 | `register_push` | Register APNs device token |
 | `new_session` | Create session (mode: "terminal" opens shell) |
 | `list_dir` | Request directory tree for a path |
