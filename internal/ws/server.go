@@ -421,6 +421,12 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			log.Printf("paste_image osascript: %v", err)
 			break
 		}
+		// Send Ctrl+V directly to the tmux session — no PTY required.
+		// tmux passes C-v to Claude Code which reads the clipboard and
+		// inserts the image as a native vision block.
+		if msg.Session != "" {
+			_ = tmux.SendKeyNoEnter(msg.Session, "C-v")
+		}
 		resp := OutboundMessage{
 			Type:    "image_pasted",
 			Payload: map[string]string{"session": msg.Session},

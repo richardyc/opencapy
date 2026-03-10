@@ -164,6 +164,14 @@ func SendKeys(sessionName, keys string) error {
 	return cmd.Run()
 }
 
+// SendKeyNoEnter sends a single key to the session without appending Enter.
+// Used for special keys like Ctrl+V that should not submit the input.
+func SendKeyNoEnter(sessionName, key string) error {
+	cmd := exec.Command(tmuxPath(), "send-keys", "-t", sessionName, key)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // ActivePane returns the index of the most recently active pane.
 func ActivePane(sessionName string) (string, error) {
 	cmd := exec.Command(tmuxPath(),"display-message", "-t", sessionName, "-p", "#{pane_index}")
