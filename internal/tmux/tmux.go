@@ -135,10 +135,16 @@ func KillSession(name string) error {
 }
 
 // Attach attaches to an existing tmux session.
+// Applies opencapy styling (brown bar, mouse scroll) before attaching so every
+// session opened through opencapy looks and behaves consistently.
 // If already inside tmux ($TMUX is set), uses switch-client to avoid nesting.
 // This replaces the current process with tmux.
 func Attach(name string) error {
 	bin := tmuxPath()
+	// Brand the session regardless of how it was originally created.
+	_ = exec.Command(bin, "set-option", "-t", name,
+		"status-style", "bg="+CapybaraColor+",fg=#F5E6D3").Run()
+	_ = exec.Command(bin, "set-option", "-t", name, "mouse", "on").Run()
 	if os.Getenv("TMUX") != "" {
 		return syscall.Exec(bin, []string{bin, "switch-client", "-t", name}, os.Environ())
 	}
@@ -168,6 +174,15 @@ func SendKeys(sessionName, keys string) error {
 // Used for special keys like Ctrl+V that should not submit the input.
 func SendKeyNoEnter(sessionName, key string) error {
 	cmd := exec.Command(tmuxPath(), "send-keys", "-t", sessionName, key)
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// SendRawKeys sends an arbitrary sequence of named tmux keys without Enter.
+// Each element of keys is a tmux key name (e.g. "Down", "Enter", "Escape").
+func SendRawKeys(sessionName string, keys []string) error {
+	args := append([]string{"send-keys", "-t", sessionName}, keys...)
+	cmd := exec.Command(tmuxPath(), args...)
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }

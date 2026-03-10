@@ -351,12 +351,17 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	case "approve":
 		if msg.Session != "" {
-			_ = tmux.SendKeys(msg.Session, "y")
+			// Claude Code permission prompts use number keys. Option 1 is always
+			// "Yes" and fires immediately without Enter.
+			_ = tmux.SendKeyNoEnter(msg.Session, "1")
 		}
 
 	case "deny":
 		if msg.Session != "" {
-			_ = tmux.SendKeys(msg.Session, "n")
+			// "No" is always the last option (option 2 or 3 depending on prompt).
+			// Navigate down past all options to land on the last one, then Enter.
+			// Pressing Down past the last item stays there, so 3 Downs is safe.
+			_ = tmux.SendRawKeys(msg.Session, []string{"Down", "Down", "Down", "Enter"})
 		}
 
 	case "send_keys":
@@ -395,7 +400,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			log.Printf("Device registered for push: %s", client.ID)
 		}
 
-	// paste_image: decode base64 JPEG, write to /tmp, set Mac clipboard via
+	// paste_image: decode base64 PNG, write to /tmp, set Mac clipboard via
 	// osascript, then ack so iOS can send Ctrl+V into the terminal.
 	case "paste_image":
 		if msg.Data == "" {
@@ -407,16 +412,26 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			break
 		}
 		// iOS sends PNG (lossless, no black-image artefacts from HEIC sources).
-		tmpPath := fmt.Sprintf("/tmp/opencapy_clip_%d.png", time.Now().UnixNano())
-		if err := os.WriteFile(tmpPath, decoded, 0o644); err != nil {
+		ts := time.Now().UnixNano()
+		pngPath := fmt.Sprintf("/tmp/opencapy_clip_%d.png", ts)
+		if err := os.WriteFile(pngPath, decoded, 0o644); err != nil {
 			log.Printf("paste_image write: %v", err)
 			break
 		}
-		// Set the Mac clipboard to the PNG image.
-		// «class PNGf» is the AppleScript PNG picture type.
+		// Electron (Claude Code) reads public.tiff from NSPasteboard via
+		// clipboard.readImage(). Setting only «class PNGf» leaves no TIFF
+		// representation, so Electron gets a blank/black image.
+		// Convert to TIFF first using sips (macOS built-in), then set
+		// the clipboard as "TIFF picture" so the TIFF UTI is present.
+		tiffPath := fmt.Sprintf("/tmp/opencapy_clip_%d.tiff", ts)
+		if err := exec.Command("sips", "-s", "format", "tiff", pngPath, "--out", tiffPath).Run(); err != nil {
+			log.Printf("paste_image sips: %v — falling back to PNG", err)
+			tiffPath = pngPath
+		}
+		clipPath := tiffPath
 		script := fmt.Sprintf(
-			`set the clipboard to (read (POSIX file "%s") as «class PNGf»)`,
-			tmpPath,
+			`set the clipboard to (read (POSIX file "%s") as TIFF picture)`,
+			clipPath,
 		)
 		if err := exec.Command("osascript", "-e", script).Run(); err != nil {
 			log.Printf("paste_image osascript: %v", err)

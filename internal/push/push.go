@@ -6,12 +6,18 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/token"
 	"github.com/richardyc/opencapy/internal/config"
 )
+
+var ansiRe = regexp.MustCompile(`\x1b(?:[@-Z\\-_]|\[[0-9;:]*[A-Za-z]|\][^\x07]*(?:\x07|$))`)
+
+// stripANSI removes ANSI/VT100 escape sequences from s.
+func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
 
 // DeviceToken represents a registered iOS device for push notifications.
 type DeviceToken struct {
@@ -227,7 +233,7 @@ func CrashPayload(session, detail string) Payload {
 		Aps: ApsPayload{
 			Alert: AlertPayload{
 				Title: "Session crashed",
-				Body:  fmt.Sprintf("[%s] %s", session, detail),
+				Body:  fmt.Sprintf("[%s] %s", session, stripANSI(detail)),
 			},
 			Sound: "default",
 		},
