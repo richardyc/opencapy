@@ -61,6 +61,8 @@ func (m *Manager) Events() <-chan PTYOutput {
 }
 
 // Open spawns a grouped tmux session mirroring sessionName inside a PTY.
+// startDir sets the working directory of the grouped session (should match the
+// target session's project path so session.projectPath is correct on iOS).
 //
 // Using "new-session -s group -t target" instead of "attach-session" gives each
 // iOS client its own independent terminal size while sharing the window group.
@@ -69,7 +71,7 @@ func (m *Manager) Events() <-chan PTYOutput {
 // in real-time via the shared window group.
 //
 // clientID identifies which WebSocket client owns this PTY session.
-func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
+func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -85,7 +87,12 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int) error {
 	// new-session -s <group> -t <target>: creates a session that shares the
 	// window group of <target>.  The group session has its own terminal size
 	// and client list, so attaching iOS here never resizes the Mac client.
-	cmd := exec.Command(tmuxBin(), "new-session", "-s", groupName, "-t", sessionName)
+	// -c sets the working directory so session.projectPath is correct on iOS.
+	args := []string{"new-session", "-s", groupName, "-t", sessionName}
+	if startDir != "" {
+		args = append(args, "-c", startDir)
+	}
+	cmd := exec.Command(tmuxBin(), args...)
 	// Ensure UTF-8 locale so tmux treats this PTY client as a Unicode terminal.
 	// Without LANG/LC_CTYPE the LaunchAgent environment has no locale set, which
 	// makes tmux fall back to ASCII mode and substitute _ for multi-byte characters.

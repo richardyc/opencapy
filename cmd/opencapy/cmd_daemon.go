@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -162,6 +163,10 @@ func newDaemonCmd() *cobra.Command {
 						}
 						liveMap := make(map[string]string, len(live))
 						for _, s := range live {
+							// Skip internal PTY mirror sessions (ocpy_*).
+							if strings.HasPrefix(s.Name, "ocpy_") {
+								continue
+							}
 							liveMap[s.Name] = s.Cwd
 						}
 

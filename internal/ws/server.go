@@ -414,7 +414,14 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if rows <= 0 {
 			rows = 24
 		}
-		if err := s.ptyMgr.Open(msg.Session, client.ID, cols, rows); err != nil {
+		// Pass the session's project path so the grouped session starts there.
+		startDir := ""
+		if s.registry != nil {
+			if p, ok := s.registry.GetProject(msg.Session); ok {
+				startDir = p
+			}
+		}
+		if err := s.ptyMgr.Open(msg.Session, client.ID, cols, rows, startDir); err != nil {
 			log.Printf("open_pty %q: %v", msg.Session, err)
 		}
 
@@ -846,6 +853,10 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 	}
 
 	for _, sess := range sessions {
+		// Skip internal PTY mirror sessions created by opencapy itself.
+		if strings.HasPrefix(sess.Name, "ocpy_") {
+			continue
+		}
 		projectPath := sess.Cwd
 		if s.registry != nil {
 			if p, ok := s.registry.GetProject(sess.Name); ok {
