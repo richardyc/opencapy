@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -392,6 +393,42 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Token != "" && s.push != nil {
 			_ = s.push.Register(msg.Token, client.ID)
 			log.Printf("Device registered for push: %s", client.ID)
+		}
+
+	// paste_image: decode base64 JPEG, write to /tmp, set Mac clipboard via
+	// osascript, then ack so iOS can send Ctrl+V into the terminal.
+	case "paste_image":
+		if msg.Data == "" {
+			break
+		}
+		decoded, err := base64.StdEncoding.DecodeString(msg.Data)
+		if err != nil {
+			log.Printf("paste_image decode: %v", err)
+			break
+		}
+		tmpPath := fmt.Sprintf("/tmp/opencapy_clip_%d.jpg", time.Now().UnixNano())
+		if err := os.WriteFile(tmpPath, decoded, 0o644); err != nil {
+			log.Printf("paste_image write: %v", err)
+			break
+		}
+		// Set the Mac clipboard to the image. The daemon runs in the Aqua
+		// session (LimitLoadToSessionType=Aqua) so osascript has clipboard access.
+		script := fmt.Sprintf(
+			`set the clipboard to (read (POSIX file "%s") as {JPEG picture})`,
+			tmpPath,
+		)
+		if err := exec.Command("osascript", "-e", script).Run(); err != nil {
+			log.Printf("paste_image osascript: %v", err)
+			break
+		}
+		resp := OutboundMessage{
+			Type:    "image_pasted",
+			Payload: map[string]string{"session": msg.Session},
+		}
+		data, _ := json.Marshal(resp)
+		select {
+		case client.send <- data:
+		default:
 		}
 
 	// ── PTY messages ──────────────────────────────────────────────────────────
