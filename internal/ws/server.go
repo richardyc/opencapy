@@ -406,15 +406,16 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			log.Printf("paste_image decode: %v", err)
 			break
 		}
-		tmpPath := fmt.Sprintf("/tmp/opencapy_clip_%d.jpg", time.Now().UnixNano())
+		// iOS sends PNG (lossless, no black-image artefacts from HEIC sources).
+		tmpPath := fmt.Sprintf("/tmp/opencapy_clip_%d.png", time.Now().UnixNano())
 		if err := os.WriteFile(tmpPath, decoded, 0o644); err != nil {
 			log.Printf("paste_image write: %v", err)
 			break
 		}
-		// Set the Mac clipboard to the image. The daemon runs in the Aqua
-		// session (LimitLoadToSessionType=Aqua) so osascript has clipboard access.
+		// Set the Mac clipboard to the PNG image.
+		// «class PNGf» is the AppleScript PNG picture type.
 		script := fmt.Sprintf(
-			`set the clipboard to (read (POSIX file "%s") as {JPEG picture})`,
+			`set the clipboard to (read (POSIX file "%s") as «class PNGf»)`,
 			tmpPath,
 		)
 		if err := exec.Command("osascript", "-e", script).Run(); err != nil {
