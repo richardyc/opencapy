@@ -73,6 +73,26 @@ func ApplyScrollConfig() {
 	_ = exec.Command(tmuxPath(),"source-file", path).Run()
 }
 
+// sessionStatusLeft returns the status-left format string for opencapy sessions:
+// bold session name followed by the pane's current directory (~ for home).
+func sessionStatusLeft() string {
+	home, _ := os.UserHomeDir()
+	// #{s|/home/user|~:pane_current_path} replaces the home prefix with ~ live.
+	return fmt.Sprintf("  #[bold]#S#[nobold]  #{s|%s|~:pane_current_path}  ", home)
+}
+
+// applySessionStyle sets the opencapy status bar style and content on a session.
+func applySessionStyle(name string) {
+	bin := tmuxPath()
+	_ = exec.Command(bin, "set-option", "-t", name,
+		"status-style", "bg="+CapybaraColor+",fg=#F5E6D3").Run()
+	_ = exec.Command(bin, "set-option", "-t", name,
+		"status-left", sessionStatusLeft()).Run()
+	_ = exec.Command(bin, "set-option", "-t", name,
+		"status-left-length", "80").Run()
+	_ = exec.Command(bin, "set-option", "-t", name, "mouse", "on").Run()
+}
+
 // NewSession creates a new detached tmux session with the opencapy capybara status bar.
 func NewSession(name, cwd string) error {
 	cmd := exec.Command(tmuxPath(),"new-session", "-d", "-s", name, "-c", cwd)
@@ -80,11 +100,7 @@ func NewSession(name, cwd string) error {
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	// Set capybara brown status bar on this session only.
-	_ = exec.Command(tmuxPath(),"set-option", "-t", name,
-		"status-style", "bg="+CapybaraColor+",fg=#F5E6D3").Run()
-	// Enable mouse so trackpad scroll works without entering copy mode.
-	_ = exec.Command(tmuxPath(),"set-option", "-t", name, "mouse", "on").Run()
+	applySessionStyle(name)
 	return nil
 }
 
@@ -109,6 +125,10 @@ func ListSessions() ([]Session, error) {
 		}
 		parts := strings.SplitN(line, sep, 5)
 		if len(parts) < 5 {
+			continue
+		}
+		// Hide internal PTY mirror sessions created by opencapy for iOS clients.
+		if strings.HasPrefix(parts[0], "ocpy_") {
 			continue
 		}
 
@@ -140,11 +160,9 @@ func KillSession(name string) error {
 // If already inside tmux ($TMUX is set), uses switch-client to avoid nesting.
 // This replaces the current process with tmux.
 func Attach(name string) error {
-	bin := tmuxPath()
 	// Brand the session regardless of how it was originally created.
-	_ = exec.Command(bin, "set-option", "-t", name,
-		"status-style", "bg="+CapybaraColor+",fg=#F5E6D3").Run()
-	_ = exec.Command(bin, "set-option", "-t", name, "mouse", "on").Run()
+	applySessionStyle(name)
+	bin := tmuxPath()
 	if os.Getenv("TMUX") != "" {
 		return syscall.Exec(bin, []string{bin, "switch-client", "-t", name}, os.Environ())
 	}

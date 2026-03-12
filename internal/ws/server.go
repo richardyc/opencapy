@@ -42,6 +42,7 @@ type InboundMessage struct {
 	Session string `json:"session"`
 	Keys    string `json:"keys,omitempty"`
 	Token   string `json:"token,omitempty"`
+	Name    string `json:"name,omitempty"` // device name for register_device
 	// PTY fields
 	Cols int    `json:"cols,omitempty"`
 	Rows int    `json:"rows,omitempty"`
