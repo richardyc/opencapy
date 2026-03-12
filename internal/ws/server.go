@@ -277,6 +277,31 @@ func isPathAllowed(path string, reg *project.Registry) bool {
 	return false
 }
 
+// isListDirAllowed is like isPathAllowed but also permits ancestor directories of
+// registered projects so the iOS folder browser can navigate up to discover new
+// project directories. Listing directory names is low-risk compared to reading
+// file contents, so this broader check is safe for list_dir only.
+func isListDirAllowed(path string, reg *project.Registry) bool {
+	if isPathAllowed(path, reg) {
+		return true
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	if reg == nil {
+		return false
+	}
+	sep := string(filepath.Separator)
+	for _, projectPath := range reg.AllProjects() {
+		// Allow any directory that is a proper ancestor of a registered project.
+		if strings.HasPrefix(projectPath, abs+sep) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns: []string{"*"},
@@ -631,7 +656,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Path == "" {
 			break
 		}
-		if !isPathAllowed(msg.Path, s.registry) {
+		if !isListDirAllowed(msg.Path, s.registry) {
 			data, _ := json.Marshal(OutboundMessage{
 				Type:    "error",
 				Payload: map[string]string{"message": "path not allowed"},
