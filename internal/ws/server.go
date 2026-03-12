@@ -1022,7 +1022,11 @@ func (s *Server) refreshTmuxStatus() {
 	s.mu.RUnlock()
 
 	if count == 0 {
-		tmux.SetGlobalStatusRight("")
+		// No phone connected — show pairing guide so first-time CLI users
+		// know what to do next.
+		host := platform.Hostname()
+		tmux.SetGlobalStatusRight(fmt.Sprintf("  \U0001F4F1 %s:%d  ", host, s.port))
+		tmux.SetGlobalStatusLeft("  \U0001F4F1 No phone connected · run `opencapy qr` to pair  ")
 		return
 	}
 
@@ -1050,6 +1054,8 @@ func (s *Server) refreshTmuxStatus() {
 	}
 
 	tmux.SetGlobalStatusRight(text)
+	// Clear the pairing guide once a phone is connected.
+	tmux.SetGlobalStatusLeft("")
 }
 
 // snapshotSessions builds a snapshot of all currently-registered sessions.

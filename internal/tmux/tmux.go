@@ -176,6 +176,17 @@ func SetGlobalStatusRight(text string) {
 	_ = exec.Command(tmuxPath(), "set-option", "-g", "status-right", text).Run()
 }
 
+// SetGlobalStatusLeft updates the left side of the status bar on every
+// tmux session. Pass an empty string to restore the default.
+func SetGlobalStatusLeft(text string) {
+	if text == "" {
+		// Restore tmux default (session name in brackets).
+		_ = exec.Command(tmuxPath(), "set-option", "-g", "status-left", "[#S] ").Run()
+	} else {
+		_ = exec.Command(tmuxPath(), "set-option", "-g", "status-left", text).Run()
+	}
+}
+
 // SendKeys sends keystrokes to a session pane.
 func SendKeys(sessionName, keys string) error {
 	cmd := exec.Command(tmuxPath(),"send-keys", "-t", sessionName, keys, "Enter")
