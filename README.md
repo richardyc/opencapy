@@ -87,7 +87,7 @@ opencapy version            # print version + build info
    - **Done:** matches `task complete`
 4. Events stream to the iOS app over WebSocket (port 7242), along with live pane output (last 15 lines, 1s cooldown)
 5. For approval events, the daemon scans a wider 50-line window to extract the `⏺ ToolName(...)` context shown in the iOS prompt card
-6. PTY mode uses `tmux new-session -s ocpy_<name> -t <name>` (a grouped session) so the iOS terminal has independent sizing without affecting the Mac terminal
+6. PTY creation is two-step: first `tmux new-session -d` (detached, synchronous) to create the grouped session and apply styling (`status-style bg=#7B5B3A,fg=#F5E6D3`) and disable mouse (`set-option mouse off`), then `attach-session` opens the PTY. Mouse is explicitly disabled on the grouped session to prevent tmux from emitting mouse-tracking escape sequences that would intercept iOS UIScrollView pan gestures in SwiftTerm
 7. Native image paste: iOS sends PNG bytes → daemon writes to `/tmp`, sets Mac clipboard via `osascript`, sends `C-v` to the tmux session → Claude Code pastes the image inline
 8. When the iOS app is backgrounded, push notifications are delivered via APNs
 
@@ -115,7 +115,7 @@ The daemon exposes a WebSocket server on port 7242.
 | `pane_content` | Scrollback history capture (300 lines by default) |
 | `pty_output` | Raw terminal bytes (base64, sent only to owning client) |
 | `session_created` | New session created via iOS request |
-| `image_pasted` | Clipboard set and C-v sent; iOS should show context compose bar |
+| `image_pasted` | Clipboard set and C-v sent; iOS should refocus terminal (no compose bar shown) |
 | `pong` | Heartbeat response |
 | `error` | Error message |
 
@@ -138,6 +138,7 @@ The daemon exposes a WebSocket server on port 7242.
 | `pty_input` | Send bytes to PTY (base64) |
 | `pty_resize` | Resize PTY (cols/rows) |
 | `close_pty` | Close PTY |
+| `register_live_activity` | Register per-activity APNs push token for a session (fields: session, token, machine) |
 | `ping` | Heartbeat (30s interval) |
 
 ### HTTP endpoints
