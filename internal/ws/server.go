@@ -55,6 +55,8 @@ type InboundMessage struct {
 	ProjectPath string `json:"project_path,omitempty"` // working directory for new session
 	// Pane capture
 	Lines int `json:"lines,omitempty"` // lines of scrollback to capture
+	// Live Activity
+	Machine string `json:"machine,omitempty"` // machine name from iOS for live activity token
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -86,19 +88,28 @@ type Server struct {
 	mu           sync.RWMutex
 	recentEvents map[string][]watcher.Event // last 50 non-output events per session
 	recentMu     sync.RWMutex
+	// Live Activity push tokens: session name → per-activity APNs token from iOS
+	liveActivityTokens   map[string]liveActivityEntry
+	liveActivityTokensMu sync.RWMutex
+}
+
+type liveActivityEntry struct {
+	token       string
+	machineName string
 }
 
 // New creates a new WebSocket server.
 func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
 	return &Server{
-		port:         port,
-		clients:      make(map[string]*Client),
-		events:       w.Events(),
-		sessionWatch: w,
-		registry:     reg,
-		push:         pushReg,
-		ptyMgr:       ptyMgr,
-		recentEvents: make(map[string][]watcher.Event),
+		port:               port,
+		clients:            make(map[string]*Client),
+		events:             w.Events(),
+		sessionWatch:       w,
+		registry:           reg,
+		push:               pushReg,
+		ptyMgr:             ptyMgr,
+		recentEvents:       make(map[string][]watcher.Event),
+		liveActivityTokens: make(map[string]liveActivityEntry),
 	}
 }
 
@@ -221,6 +232,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("websocket accept: %v", err)
 		return
 	}
+	// Allow large inbound messages (e.g. base64-encoded images for paste_image).
+	// Default is 32KB which is too small for image payloads.
+	conn.SetReadLimit(20 * 1024 * 1024) // 20 MB
 
 	clientID := fmt.Sprintf("client-%d", time.Now().UnixNano())
 	client := &Client{
@@ -366,6 +380,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	case "send_keys":
 		if msg.Session != "" && msg.Keys != "" {
+			log.Printf("send_keys %q: %q", msg.Session, msg.Keys)
 			_ = tmux.SendKeys(msg.Session, msg.Keys)
 		}
 
@@ -400,15 +415,42 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			log.Printf("Device registered for push: %s", client.ID)
 		}
 
+	case "register_live_activity":
+		if msg.Session != "" && msg.Token != "" {
+			s.liveActivityTokensMu.Lock()
+			s.liveActivityTokens[msg.Session] = liveActivityEntry{
+				token:       msg.Token,
+				machineName: msg.Machine,
+			}
+			s.liveActivityTokensMu.Unlock()
+			log.Printf("[live activity] registered token for session %s (machine=%s)", msg.Session, msg.Machine)
+		}
+
 	// paste_image: decode base64 PNG, write to /tmp, set Mac clipboard via
 	// osascript, then ack so iOS can send Ctrl+V into the terminal.
 	case "paste_image":
+		sendImageAck := func(errMsg string) {
+			payload := map[string]string{"session": msg.Session}
+			if errMsg != "" {
+				payload["error"] = errMsg
+			}
+			resp := OutboundMessage{
+				Type:    "image_pasted",
+				Payload: payload,
+			}
+			data, _ := json.Marshal(resp)
+			select {
+			case client.send <- data:
+			default:
+			}
+		}
 		if msg.Data == "" {
 			break
 		}
 		decoded, err := base64.StdEncoding.DecodeString(msg.Data)
 		if err != nil {
 			log.Printf("paste_image decode: %v", err)
+			sendImageAck("Failed to decode image")
 			break
 		}
 		// iOS sends PNG (lossless, no black-image artefacts from HEIC sources).
@@ -416,6 +458,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		pngPath := fmt.Sprintf("/tmp/opencapy_clip_%d.png", ts)
 		if err := os.WriteFile(pngPath, decoded, 0o644); err != nil {
 			log.Printf("paste_image write: %v", err)
+			sendImageAck("Failed to write image")
 			break
 		}
 		// Electron (Claude Code) reads public.tiff from NSPasteboard via
@@ -435,6 +478,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		)
 		if err := exec.Command("osascript", "-e", script).Run(); err != nil {
 			log.Printf("paste_image osascript: %v", err)
+			sendImageAck("Failed to set clipboard")
 			break
 		}
 		// Brief pause so the NSPasteboard change fully propagates before
@@ -446,15 +490,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Session != "" {
 			_ = tmux.SendKeyNoEnter(msg.Session, "\x16")
 		}
-		resp := OutboundMessage{
-			Type:    "image_pasted",
-			Payload: map[string]string{"session": msg.Session},
-		}
-		data, _ := json.Marshal(resp)
-		select {
-		case client.send <- data:
-		default:
-		}
+		sendImageAck("")
 
 	// ── PTY messages ──────────────────────────────────────────────────────────
 
@@ -496,6 +532,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			log.Printf("pty_input decode: %v", err)
 			break
 		}
+		log.Printf("pty_input %q: %d bytes %v", msg.Session, len(decoded), decoded)
 		if err := s.ptyMgr.Write(msg.Session, decoded); err != nil {
 			log.Printf("pty_input write %q: %v", msg.Session, err)
 		}
@@ -596,7 +633,9 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if lines <= 0 {
 			lines = 300
 		}
-		output, err := tmux.CapturePaneOutput(msg.Session, lines)
+		// Plain text (no -e) so SwiftTerm accumulates scrollback lines instead
+		// of cursor-positioning escape sequences that prevent scrollback growth.
+		output, err := tmux.CapturePaneOutput(msg.Session, lines, false)
 		if err != nil {
 			log.Printf("capture_pane %q: %v", msg.Session, err)
 			break
@@ -737,6 +776,16 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
 	// Resolve working directory: use provided path, first registered project, or home dir.
 	cwd := msg.ProjectPath
+	// Expand leading ~ because tmux's -c flag does not perform tilde expansion.
+	if cwd == "~" {
+		if h, err := os.UserHomeDir(); err == nil {
+			cwd = h
+		}
+	} else if strings.HasPrefix(cwd, "~/") {
+		if h, err := os.UserHomeDir(); err == nil {
+			cwd = filepath.Join(h, cwd[2:])
+		}
+	}
 	if cwd == "" && s.registry != nil {
 		if projects := s.registry.AllProjects(); len(projects) > 0 {
 			cwd = projects[0]
@@ -858,6 +907,47 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 					s.push.Send(push.DonePayload(ev.Session))
 				}
 			}
+
+			// Live Activity push — sent for key events regardless of WS client count
+			// so the lock screen Live Activity updates even when the app is backgrounded.
+			if s.push != nil {
+				s.liveActivityTokensMu.RLock()
+				entry, hasToken := s.liveActivityTokens[ev.Session]
+				s.liveActivityTokensMu.RUnlock()
+
+				if hasToken {
+					var state *push.LiveActivityContentState
+					switch ev.Type {
+					case watcher.EventApproval:
+						content := ev.Content
+						state = &push.LiveActivityContentState{
+							SessionName:     ev.Session,
+							MachineName:     entry.machineName,
+							Status:          "approval",
+							LastOutput:      content,
+							NeedsApproval:   true,
+							ApprovalContent: &content,
+						}
+					case watcher.EventDone:
+						state = &push.LiveActivityContentState{
+							SessionName: ev.Session,
+							MachineName: entry.machineName,
+							Status:      "done",
+							LastOutput:  ev.Content,
+						}
+					case watcher.EventCrash:
+						state = &push.LiveActivityContentState{
+							SessionName: ev.Session,
+							MachineName: entry.machineName,
+							Status:      "crashed",
+							LastOutput:  ev.Content,
+						}
+					}
+					if state != nil {
+						go s.push.SendLiveActivity(entry.token, *state)
+					}
+				}
+			}
 		}
 	}
 }
@@ -926,7 +1016,7 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 			}
 		}
 
-		output, _ := tmux.CapturePaneOutput(sess.Name, 20)
+		output, _ := tmux.CapturePaneOutput(sess.Name, 20, true)
 		// Trim to last 20 lines just in case
 		lines := strings.Split(output, "\n")
 		if len(lines) > 20 {

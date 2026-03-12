@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"time"
 
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/token"
@@ -254,5 +255,77 @@ func DonePayload(session string) Payload {
 		},
 		Session: session,
 		Event:   "done",
+	}
+}
+
+// LiveActivityContentState mirrors OpenCapyActivityAttributes.ContentState in Swift.
+// Field names must match the Swift struct's JSON encoding (camelCase, no transformation).
+type LiveActivityContentState struct {
+	SessionName      string  `json:"sessionName"`
+	MachineName      string  `json:"machineName"`
+	WorkingDirectory string  `json:"workingDirectory"`
+	Status           string  `json:"status"`
+	LastOutput       string  `json:"lastOutput"`
+	NeedsApproval    bool    `json:"needsApproval"`
+	ApprovalContent  *string `json:"approvalContent,omitempty"`
+}
+
+// liveActivityAps is the aps dict for ActivityKit push notifications.
+type liveActivityAps struct {
+	Timestamp    int64                     `json:"timestamp"`
+	Event        string                    `json:"event"`
+	ContentState LiveActivityContentState   `json:"content-state"`
+	Alert        *AlertPayload             `json:"alert,omitempty"`
+}
+
+type liveActivityPayload struct {
+	Aps liveActivityAps `json:"aps"`
+}
+
+// SendLiveActivity sends an ActivityKit push to update a specific Live Activity
+// identified by its per-activity push token (from iOS activity.pushTokenUpdates).
+// This works even when the iOS app is backgrounded or the screen is locked.
+func (r *Registry) SendLiveActivity(activityToken string, state LiveActivityContentState) {
+	r.mu.RLock()
+	client := r.apnsClient
+	bundleID := r.bundleID
+	r.mu.RUnlock()
+
+	aps := liveActivityAps{
+		Timestamp:    time.Now().Unix(),
+		Event:        "update",
+		ContentState: state,
+	}
+	if state.NeedsApproval {
+		aps.Alert = &AlertPayload{
+			Title: "Approval needed",
+			Body:  fmt.Sprintf("[%s] Claude Code needs your input", state.SessionName),
+		}
+	}
+
+	data, err := json.Marshal(liveActivityPayload{Aps: aps})
+	if err != nil {
+		log.Printf("[push] marshal live activity payload: %v", err)
+		return
+	}
+
+	if client == nil {
+		log.Printf("[push stub] would send live activity update for session %s: %s", state.SessionName, state.Status)
+		return
+	}
+
+	n := &apns2.Notification{
+		DeviceToken: activityToken,
+		Topic:       bundleID + ".push-type.liveactivity",
+		Payload:     data,
+		PushType:    apns2.PushTypeLiveActivity,
+	}
+	res, err := client.Push(n)
+	if err != nil {
+		log.Printf("[push] Live Activity APNs send: %v", err)
+	} else if res.StatusCode != 200 {
+		log.Printf("[push] Live Activity APNs non-200: %d %s", res.StatusCode, res.Reason)
+	} else {
+		log.Printf("[push] Live Activity update delivered for %s (status=%s)", state.SessionName, state.Status)
 	}
 }

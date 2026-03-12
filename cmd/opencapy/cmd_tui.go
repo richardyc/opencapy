@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -236,6 +237,9 @@ func humanDuration(d time.Duration) string {
 // runTUI launches the full-screen session manager and executes the chosen action.
 func runTUI(cwd string) error {
 	sessions, _ := tmux.ListSessions()
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].LastActive.After(sessions[j].LastActive)
+	})
 	reg, _ := project.Load()
 
 	// Auto-increment name for "new session here"

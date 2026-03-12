@@ -64,11 +64,15 @@ func (m *Manager) Events() <-chan PTYOutput {
 // startDir sets the working directory of the grouped session (should match the
 // target session's project path so session.projectPath is correct on iOS).
 //
-// Using "new-session -s group -t target" instead of "attach-session" gives each
-// iOS client its own independent terminal size while sharing the window group.
-// This means the Mac user's terminal dimensions are never affected by the iOS
-// connection, and changes on the Mac (keystrokes, program output) are reflected
-// in real-time via the shared window group.
+// Two-step approach: first create the grouped session synchronously (detached),
+// apply styling, then open a PTY via attach-session. This avoids the race
+// condition where set-option ran before new-session had registered with the
+// tmux server, causing the brown status bar to never appear.
+//
+// Mouse is explicitly disabled on the grouped session so tmux does not emit
+// mouse-tracking escape sequences (\x1b[?1003h etc.) into the PTY. Those codes
+// cause SwiftTerm's terminal emulator to activate mouse-tracking mode internally,
+// intercepting UIScrollView pan gestures even when allowMouseReporting=false.
 //
 // clientID identifies which WebSocket client owns this PTY session.
 func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir string) error {
@@ -84,15 +88,29 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir st
 	// Kill any stale grouped session from a previous connection (idempotent).
 	_ = exec.Command(tmuxBin(), "kill-session", "-t", groupName).Run()
 
-	// new-session -s <group> -t <target>: creates a session that shares the
-	// window group of <target>.  The group session has its own terminal size
-	// and client list, so attaching iOS here never resizes the Mac client.
-	// -c sets the working directory so session.projectPath is correct on iOS.
-	args := []string{"new-session", "-s", groupName, "-t", sessionName}
+	// Step 1: Create the grouped session synchronously (detached, no PTY yet).
+	// new-session -d -s <group> -t <target>: creates a detached session that
+	// shares the window group of <target>.  The group session has its own
+	// terminal size and client list, so attaching iOS here never resizes the
+	// Mac client.
+	createArgs := []string{"new-session", "-d", "-s", groupName, "-t", sessionName}
 	if startDir != "" {
-		args = append(args, "-c", startDir)
+		createArgs = append(createArgs, "-c", startDir)
 	}
-	cmd := exec.Command(tmuxBin(), args...)
+	if err := exec.Command(tmuxBin(), createArgs...).Run(); err != nil {
+		return fmt.Errorf("create grouped session for %q: %w", sessionName, err)
+	}
+
+	// Step 2: Apply opencapy branding now that the session definitely exists.
+	// Per-session set-option so this only affects the ocpy_ mirror session.
+	_ = exec.Command(tmuxBin(), "set-option", "-t", groupName,
+		"status-style", "bg=#7B5B3A,fg=#F5E6D3").Run()
+	// Disable mouse so tmux does not send mouse-tracking enable sequences that
+	// would intercept iOS UIScrollView touch events inside SwiftTerm.
+	_ = exec.Command(tmuxBin(), "set-option", "-t", groupName, "mouse", "off").Run()
+
+	// Step 3: Open a PTY by attaching to the already-created grouped session.
+	cmd := exec.Command(tmuxBin(), "attach-session", "-t", groupName)
 	// Ensure UTF-8 locale so tmux treats this PTY client as a Unicode terminal.
 	// Without LANG/LC_CTYPE the LaunchAgent environment has no locale set, which
 	// makes tmux fall back to ASCII mode and substitute _ for multi-byte characters.
@@ -107,6 +125,7 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir st
 		Rows: uint16(rows),
 	})
 	if err != nil {
+		_ = exec.Command(tmuxBin(), "kill-session", "-t", groupName).Run()
 		return fmt.Errorf("start pty for session %q: %w", sessionName, err)
 	}
 

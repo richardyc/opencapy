@@ -141,7 +141,7 @@ func (w *Watcher) poll() {
 	w.mu.RUnlock()
 
 	for _, name := range names {
-		output, err := tmux.CapturePaneOutput(name, 20)
+		output, err := tmux.CapturePaneOutput(name, 20, true)
 		if err != nil {
 			continue
 		}
@@ -178,7 +178,7 @@ func (w *Watcher) poll() {
 		// Enrich approval with a wider context window to find the ⏺ tool call.
 		for i, ev := range structured {
 			if ev.Type == EventApproval {
-				ctx50, _ := tmux.CapturePaneOutput(name, 50)
+				ctx50, _ := tmux.CapturePaneOutput(name, 50, true)
 				structured[i].Content = extractApprovalContext(ctx50)
 			}
 		}

@@ -152,10 +152,17 @@ func Attach(name string) error {
 }
 
 // CapturePaneOutput captures the last N lines from the active pane.
-func CapturePaneOutput(sessionName string, lines int) (string, error) {
+// withEscape=true preserves ANSI sequences (for live output display).
+// withEscape=false returns plain text (for SwiftTerm scrollback — escape
+// sequences cause cursor positioning which prevents lines from accumulating
+// in the scrollback buffer).
+func CapturePaneOutput(sessionName string, lines int, withEscape bool) (string, error) {
 	start := fmt.Sprintf("-%d", lines)
-	// -e preserves ANSI escape sequences so iOS can render colours universally.
-	cmd := exec.Command(tmuxPath(), "capture-pane", "-t", sessionName, "-p", "-e", "-S", start)
+	args := []string{"capture-pane", "-t", sessionName, "-p", "-S", start}
+	if withEscape {
+		args = append(args, "-e")
+	}
+	cmd := exec.Command(tmuxPath(), args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
