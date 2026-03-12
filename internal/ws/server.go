@@ -20,6 +20,7 @@ import (
 
 	"github.com/richardyc/opencapy/internal/fsevent"
 	fs "github.com/richardyc/opencapy/internal/fs"
+	"github.com/richardyc/opencapy/internal/mdns"
 	"github.com/richardyc/opencapy/internal/platform"
 	ptymanager "github.com/richardyc/opencapy/internal/pty"
 	"github.com/richardyc/opencapy/internal/project"
@@ -153,6 +154,25 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Broadcast events to all clients
 	go s.broadcastLoop(ctx)
+
+	// Connect outbound to relay as "mac" so iOS clients can reach us.
+	if s.relayToken != "" {
+		go s.runRelayClient(ctx)
+	}
+
+	// Advertise on the local network via mDNS/Bonjour so iOS can connect
+	// directly when on the same Wi-Fi — skipping the relay entirely.
+	if s.relayToken != "" {
+		hostname := platform.Hostname()
+		if pub, err := mdns.Publish(hostname, s.relayToken, s.port); err != nil {
+			log.Printf("[mDNS] failed to advertise: %v", err)
+		} else {
+			go func() {
+				<-ctx.Done()
+				pub.Stop()
+			}()
+		}
+	}
 
 	// Graceful shutdown
 	go func() {
@@ -1158,4 +1178,122 @@ func (s *Server) ClientCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.clients)
+}
+
+// runRelayClient connects outbound to the relay as "mac" and routes messages
+// to/from the existing handleInbound machinery. Reconnects automatically.
+func (s *Server) runRelayClient(ctx context.Context) {
+	wsURL := relay.WSURL(s.relayToken, relay.DefaultRelayURL, "mac")
+	backoff := 2 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if err := s.dialRelay(ctx, wsURL); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("[relay] disconnected (%v) — reconnecting in %s", err, backoff)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+		}
+	}
+}
+
+func (s *Server) dialRelay(ctx context.Context, wsURL string) error {
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		// Allow large messages (images, PTY output)
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	if err != nil {
+		return err
+	}
+	conn.SetReadLimit(20 * 1024 * 1024)
+	defer conn.CloseNow()
+
+	clientID := fmt.Sprintf("relay-mac-%d", time.Now().UnixNano())
+	client := &Client{
+		ID:   clientID,
+		conn: conn,
+		send: make(chan []byte, 256),
+	}
+
+	s.mu.Lock()
+	s.clients[clientID] = client
+	s.mu.Unlock()
+	log.Printf("[relay] connected as mac (token …%s)", s.relayToken[len(s.relayToken)-8:])
+	go s.refreshTmuxStatus()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.clients, clientID)
+		s.mu.Unlock()
+		close(client.send)
+		go s.refreshTmuxStatus()
+	}()
+
+	// Writer goroutine: drain client.send → relay WebSocket
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for msg := range client.send {
+			writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			_ = conn.Write(writeCtx, websocket.MessageText, msg)
+			cancel()
+		}
+	}()
+
+	// Send a snapshot immediately so iOS gets sessions as soon as it connects.
+	go func() {
+		snapshots := s.snapshotSessions()
+		msg := OutboundMessage{Type: "snapshot", Payload: snapshots}
+		data, _ := json.Marshal(msg)
+		select {
+		case client.send <- data:
+		default:
+		}
+	}()
+
+	// Reader: relay forwards iOS messages here
+	for {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			return err
+		}
+
+		var msg InboundMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+
+		// Skip relay control messages
+		if msg.Type == "relay_connected" || msg.Type == "peer_connected" || msg.Type == "peer_disconnected" {
+			if msg.Type == "peer_connected" {
+				// iOS just connected — push a fresh snapshot
+				go func() {
+					snapshots := s.snapshotSessions()
+					out := OutboundMessage{Type: "snapshot", Payload: snapshots}
+					outData, _ := json.Marshal(out)
+					select {
+					case client.send <- outData:
+					default:
+					}
+				}()
+			}
+			continue
+		}
+
+		s.handleInbound(ctx, client, msg)
+	}
 }

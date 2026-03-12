@@ -17,6 +17,7 @@ import (
 	qrcode "github.com/skip2/go-qrcode"
 	"github.com/richardyc/opencapy/internal/config"
 	"github.com/richardyc/opencapy/internal/platform"
+	"github.com/richardyc/opencapy/internal/relay"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -61,34 +62,27 @@ func newQRCmd() *cobra.Command {
 		Use:   "qr",
 		Short: "Show connection QR code for iOS pairing",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load()
+			token, err := relay.LoadOrCreate()
 			if err != nil {
-				return fmt.Errorf("load config: %w", err)
+				return fmt.Errorf("relay token: %w", err)
 			}
 
-			hostname, isTailscale := platform.TailscaleHostname()
-			connType := "tailscale"
-			if isTailscale {
-				fmt.Printf("Tailscale address detected: %s\n", hostname)
-			} else {
-				fmt.Printf("Tailscale not running — using hostname: %s (install Tailscale for best connectivity)\n", hostname)
-				connType = "ssh"
-			}
+			hostname := platform.Hostname()
+			pairURL := relay.PairURL(token, hostname, relay.DefaultRelayURL)
 
-			url := fmt.Sprintf("opencapy://pair?name=%s&host=%s&port=%d&type=%s",
-				platform.Hostname(), hostname, cfg.Port, connType)
-
-			fmt.Println("Connect your iOS device to this machine:")
+			fmt.Println("Scan with the OpenCapy iOS app to pair:")
 			fmt.Println()
 
-			qr, err := qrcode.New(url, qrcode.Medium)
+			qr, err := qrcode.New(pairURL, qrcode.Medium)
 			if err != nil {
-				// Fallback to just printing URL
-				fmt.Printf("  %s\n", url)
+				fmt.Printf("  %s\n", pairURL)
 				return nil
 			}
 			fmt.Println(qr.ToSmallString(false))
-			fmt.Printf("  %s\n", url)
+			fmt.Printf("  Machine: %s\n", hostname)
+			fmt.Printf("  Relay:   %s\n", relay.DefaultRelayURL)
+			fmt.Println()
+			fmt.Println("Don't have the app? Download OpenCapy on the App Store.")
 			return nil
 		},
 	}

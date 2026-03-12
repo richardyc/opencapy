@@ -195,6 +195,13 @@ func (m tuiModel) View() string {
 
 	b.WriteString("\n")
 
+	// Pairing hint when no sessions exist yet
+	if len(m.sessions) == 0 {
+		b.WriteString("\n")
+		b.WriteString(styleHelp.Render("  No sessions yet — press Enter to create one") + "\n")
+		b.WriteString(styleHelp.Render("  To pair your iPhone: run  opencapy qr  in another terminal") + "\n")
+	}
+
 	// Help bar
 	help := "  ↑↓/kj navigate   enter attach   d kill   n new   q quit"
 	b.WriteString(styleHelp.Render(help) + "\n")
