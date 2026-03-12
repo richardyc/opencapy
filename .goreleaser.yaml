@@ -39,3 +39,21 @@ release:
   draft: false
   prerelease: auto
   make_latest: true
+
+brews:
+  - name: opencapy
+    repository:
+      owner: richardyc
+      name: homebrew-opencapy
+      token: "{{ .Env.GITHUB_TOKEN }}"
+    commit_author:
+      name: opencapy-bot
+      email: bot@opencapy.dev
+    directory: Formula
+    homepage: "https://opencapy.dev"
+    description: "Your machines, mirrored. Code from anywhere."
+    license: "MIT"
+    install: |
+      bin.install "opencapy"
+    test: |
+      system "#{bin}/opencapy", "--help"
