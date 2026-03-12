@@ -473,6 +473,16 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			log.Printf("Device registered for push: %s", client.ID)
 		}
 
+	case "register_device":
+		// Sent immediately on connect so status bar shows device name right away.
+		if msg.Name != "" {
+			s.clientDeviceNamesMu.Lock()
+			s.clientDeviceNames[client.ID] = msg.Name
+			s.clientDeviceNamesMu.Unlock()
+			log.Printf("Device name registered: %s (%s)", msg.Name, client.ID)
+			go s.refreshTmuxStatus()
+		}
+
 	case "register_live_activity":
 		if msg.Session != "" && msg.Token != "" {
 			s.liveActivityTokensMu.Lock()
@@ -1073,7 +1083,7 @@ func (s *Server) refreshTmuxStatus() {
 		// know what to do next.
 		host := platform.Hostname()
 		tmux.SetGlobalStatusRight(fmt.Sprintf("  \U0001F4F1 %s:%d  ", host, s.port))
-		tmux.SetGlobalStatusLeft("  \U0001F4F1 No phone connected · run `opencapy qr` to pair  ")
+		tmux.SetGlobalStatusLeft("  #[fg=red]●#[default] No phone · run `opencapy qr` to pair  ")
 		return
 	}
 
@@ -1091,13 +1101,13 @@ func (s *Server) refreshTmuxStatus() {
 	var text string
 	switch {
 	case len(uniqueNames) == 1:
-		text = fmt.Sprintf("  \U0001F4F1 %s  ", uniqueNames[0])
+		text = fmt.Sprintf("  #[fg=green]●#[default] %s  ", uniqueNames[0])
 	case len(uniqueNames) > 1:
-		text = fmt.Sprintf("  \U0001F4F1 %d connected  ", len(uniqueNames))
+		text = fmt.Sprintf("  #[fg=green]●#[default] %d iPhones  ", len(uniqueNames))
 	case count == 1:
-		text = "  \U0001F4F1 1 phone  "
+		text = "  #[fg=green]●#[default] 1 phone  "
 	default:
-		text = fmt.Sprintf("  \U0001F4F1 %d phones  ", count)
+		text = fmt.Sprintf("  #[fg=green]●#[default] %d phones  ", count)
 	}
 
 	tmux.SetGlobalStatusRight(text)
