@@ -205,6 +205,10 @@ func newInstallCmd() *cobra.Command {
 				return fmt.Errorf("find binary path: %w", err)
 			}
 
+			if err := ensureTmux(); err != nil {
+				return fmt.Errorf("tmux required: %w", err)
+			}
+
 			if platform.IsMacOS() {
 				fmt.Println("Installing LaunchAgent...")
 				if err := platform.InstallLaunchAgent(binaryPath); err != nil {
@@ -450,6 +454,59 @@ fi`
 		fmt.Println("Restart your terminal (or run: source ~/.zshrc) to activate.")
 		fmt.Println("To undo, remove the '# opencapy: auto-attach' block from your shell profile.")
 	}
+}
+
+// ensureTmux checks that tmux is available, and installs it if not.
+func ensureTmux() error {
+	if _, err := exec.LookPath("tmux"); err == nil {
+		return nil // already installed
+	}
+
+	fmt.Println("tmux not found — installing...")
+
+	// Detect package manager and build install command.
+	type pm struct {
+		bin  string
+		args []string
+	}
+	var mgr *pm
+	switch {
+	case runtime.GOOS == "darwin":
+		if _, err := exec.LookPath("brew"); err == nil {
+			mgr = &pm{"brew", []string{"install", "tmux"}}
+		}
+	default:
+		for _, candidate := range []pm{
+			{"apt-get", []string{"install", "-y", "tmux"}},
+			{"dnf", []string{"install", "-y", "tmux"}},
+			{"yum", []string{"install", "-y", "tmux"}},
+			{"pacman", []string{"-S", "--noconfirm", "tmux"}},
+			{"zypper", []string{"install", "-y", "tmux"}},
+		} {
+			if _, err := exec.LookPath(candidate.bin); err == nil {
+				mgr = &pm{candidate.bin, candidate.args}
+				break
+			}
+		}
+	}
+
+	if mgr == nil {
+		return fmt.Errorf("could not find a supported package manager — please install tmux manually and re-run")
+	}
+
+	cmd := exec.Command(mgr.bin, mgr.args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("install tmux via %s: %w", mgr.bin, err)
+	}
+
+	// Verify install succeeded.
+	if _, err := exec.LookPath("tmux"); err != nil {
+		return fmt.Errorf("tmux still not found after install — please install manually")
+	}
+	fmt.Println("tmux installed successfully.")
+	return nil
 }
 
 // loginShell returns the login shell for the given username by reading /etc/passwd.
