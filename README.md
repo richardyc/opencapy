@@ -36,7 +36,7 @@ claude
 opencapy qr           # shows QR code — scan with the iOS app
 ```
 
-The iOS app connects via Tailscale (Mac) or SSH tunnel (Linux/VPS). Sessions appear automatically within 2 seconds of creation — no daemon restart needed.
+The iOS app connects via **relay** (default, works everywhere — no VPN needed), Tailscale, or SSH tunnel. Sessions appear automatically within 2 seconds of creation — no daemon restart needed.
 
 ## iOS App
 
@@ -54,7 +54,18 @@ Download on the App Store or TestFlight. Source: [richardyc/opencapy-ios](https:
 - Session list with live status indicators (pulsing green for active, solid green for recently active)
 - Create and delete sessions from iOS
 - Auto-reconnects when network/VPN comes back
-- Connects via Tailscale (zero-config on Mac) or SSH tunnel (Linux/VPS)
+- **Relay connection** — scan QR, done. No VPN, no port forwarding, works with any existing VPN
+- Tailscale and SSH tunnel also supported for direct/private connections
+
+## Connection methods
+
+| Method | Setup | Works with existing VPN | Direct / private |
+|--------|-------|------------------------|-----------------|
+| **Relay** (default) | Scan QR — done | ✅ Any VPN | Routes via relay.opencapy.dev |
+| **Tailscale** | Install Tailscale on both devices | ⚠️ May conflict | ✅ Direct WireGuard |
+| **SSH** | Expose SSH port, add iOS public key | ✅ | ✅ Direct tunnel |
+
+The relay is a Cloudflare Durable Objects WebSocket broker. No ports are opened on your machine. The pairing token (`~/.opencapy/relay_token.json`) is 256-bit random and is generated once — keep it private.
 
 ## CLI reference
 

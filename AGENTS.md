@@ -17,7 +17,9 @@ Users run `opencapy` to create/manage tmux sessions via a bubbletea full-screen 
 - internal/push/ — APNs push bridge
 - internal/project/ — session->project registry (cwd-locked)
 - internal/config/ — ~/.opencapy/config.json
+- internal/relay/ — relay token (LoadOrCreate, PairURL, WSURL helpers)
 - internal/platform/ — OS detection, LaunchAgent/systemd helpers
+- relay/ — Cloudflare Workers + Durable Objects relay (TypeScript, deploy with `wrangler deploy`)
 - Formula/opencapy.rb — homebrew formula lives in richardyc/homebrew-opencapy (separate tap repo, auto-updated by goreleaser on release)
 - install/install.sh — Linux curl-install script
 
@@ -25,6 +27,8 @@ Users run `opencapy` to create/manage tmux sessions via a bubbletea full-screen 
 - tmux IS the session registry (no separate DB)
 - session-to-project mapping locked at creation time (cwd never remaps)
 - WebSocket port: 7242 (hardcoded, env OPENCAPY_PORT to override)
+- **Relay**: default pairing method. Token at `~/.opencapy/relay_token.json` (256-bit, generated once). QR encodes `opencapy://pair?type=relay&token=<hex>&relay=wss://relay.opencapy.dev&name=<hostname>`. Tailscale/SSH kept as advanced options.
+- Relay token exposed via `/pair` JSON endpoint and `/qr` PNG endpoint
 - Config: ~/.opencapy/config.json
 - CC output parsed via capture-pane + regex (clean text, no ANSI parsing)
 - Session reconciler runs every 2s: diffs live `tmux list-sessions` against registry, adds/removes, broadcasts snapshot on changes

@@ -24,6 +24,7 @@ import (
 	ptymanager "github.com/richardyc/opencapy/internal/pty"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/push"
+	"github.com/richardyc/opencapy/internal/relay"
 	"github.com/richardyc/opencapy/internal/tmux"
 	"github.com/richardyc/opencapy/internal/watcher"
 )
@@ -79,6 +80,7 @@ type Client struct {
 // Server is the WebSocket server that bridges watcher events to iOS.
 type Server struct {
 	port         int
+	relayToken   string // persistent token for relay pairing (loaded once at startup)
 	clients      map[string]*Client
 	events       <-chan watcher.Event
 	sessionWatch *watcher.Watcher
@@ -104,8 +106,14 @@ type liveActivityEntry struct {
 
 // New creates a new WebSocket server.
 func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
+	// Load (or generate on first run) the persistent relay pairing token.
+	relayToken, err := relay.LoadOrCreate()
+	if err != nil {
+		log.Printf("[relay] failed to load token: %v — relay pairing unavailable", err)
+	}
 	return &Server{
 		port:               port,
+		relayToken:         relayToken,
 		clients:            make(map[string]*Client),
 		events:             w.Events(),
 		sessionWatch:       w,
@@ -162,6 +170,7 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // handleQR generates and serves a QR code PNG for pairing.
+// Relay is the default pairing method; Tailscale is the fallback.
 func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -169,12 +178,18 @@ func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hostname := platform.Hostname()
-	tailscaleHost, _ := platform.TailscaleHostname()
-
-	qrContent := fmt.Sprintf(
-		"opencapy://pair?name=%s&host=%s&port=%d&type=tailscale",
-		hostname, tailscaleHost, s.port,
-	)
+	var qrContent string
+	if s.relayToken != "" {
+		// Relay pairing — no Tailscale or SSH required.
+		qrContent = relay.PairURL(s.relayToken, hostname, relay.DefaultRelayURL)
+	} else {
+		// Fallback to Tailscale if relay token unavailable.
+		tailscaleHost, _ := platform.TailscaleHostname()
+		qrContent = fmt.Sprintf(
+			"opencapy://pair?name=%s&host=%s&port=%d&type=tailscale",
+			hostname, tailscaleHost, s.port,
+		)
+	}
 
 	png, err := qrcode.Encode(qrContent, qrcode.Medium, 256)
 	if err != nil {
@@ -195,15 +210,27 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hostname := platform.Hostname()
-	tailscaleHost, _ := platform.TailscaleHostname()
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"name": hostname,
-		"host": tailscaleHost,
-		"port": s.port,
-		"type": "tailscale",
-	})
+
+	if s.relayToken != "" {
+		// Relay is the default pairing method.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"name":      hostname,
+			"type":      "relay",
+			"relay_url": relay.DefaultRelayURL,
+			"token":     s.relayToken,
+			"pair_url":  relay.PairURL(s.relayToken, hostname, relay.DefaultRelayURL),
+		})
+	} else {
+		// Fallback: Tailscale direct.
+		tailscaleHost, _ := platform.TailscaleHostname()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"name": hostname,
+			"host": tailscaleHost,
+			"port": s.port,
+			"type": "tailscale",
+		})
+	}
 }
 
 // isPathAllowed checks whether path falls within one of the registered project paths,
