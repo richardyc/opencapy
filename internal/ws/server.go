@@ -91,6 +91,10 @@ type Server struct {
 	// Live Activity push tokens: session name → per-activity APNs token from iOS
 	liveActivityTokens   map[string]liveActivityEntry
 	liveActivityTokensMu sync.RWMutex
+	// Device names: clientID → human-readable device name (e.g. "Richard's iPhone")
+	// Populated when iOS registers a Live Activity (which includes the machine name).
+	clientDeviceNames   map[string]string
+	clientDeviceNamesMu sync.RWMutex
 }
 
 type liveActivityEntry struct {
@@ -110,6 +114,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		ptyMgr:             ptyMgr,
 		recentEvents:       make(map[string][]watcher.Event),
 		liveActivityTokens: make(map[string]liveActivityEntry),
+		clientDeviceNames:  make(map[string]string),
 	}
 }
 
@@ -248,6 +253,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	log.Printf("Client connected: %s", clientID)
+	go s.refreshTmuxStatus()
 
 	ctx := r.Context()
 
@@ -312,6 +318,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		delete(s.clients, clientID)
 		s.mu.Unlock()
 
+		s.clientDeviceNamesMu.Lock()
+		delete(s.clientDeviceNames, clientID)
+		s.clientDeviceNamesMu.Unlock()
+
 		// Clean up all PTY sessions owned by this client
 		if s.ptyMgr != nil {
 			s.ptyMgr.CloseByClient(clientID)
@@ -320,6 +330,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		close(client.send)
 		conn.CloseNow()
 		log.Printf("Client disconnected: %s", clientID)
+		go s.refreshTmuxStatus()
 	}()
 
 	for {
@@ -424,6 +435,13 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			}
 			s.liveActivityTokensMu.Unlock()
 			log.Printf("[live activity] registered token for session %s (machine=%s)", msg.Session, msg.Machine)
+			// Store the device name so we can show it in the tmux status bar.
+			if msg.Machine != "" {
+				s.clientDeviceNamesMu.Lock()
+				s.clientDeviceNames[client.ID] = msg.Machine
+				s.clientDeviceNamesMu.Unlock()
+				go s.refreshTmuxStatus()
+			}
 		}
 
 	// paste_image: decode base64 PNG, write to /tmp, set Mac clipboard via
@@ -993,6 +1011,45 @@ func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
 	case c.send <- data:
 	default:
 	}
+}
+
+// refreshTmuxStatus updates the right side of the tmux status bar to show
+// how many iOS devices are connected (and the device name when only one is).
+// Device names are populated once the iOS app registers a Live Activity.
+func (s *Server) refreshTmuxStatus() {
+	s.mu.RLock()
+	count := len(s.clients)
+	s.mu.RUnlock()
+
+	if count == 0 {
+		tmux.SetGlobalStatusRight("")
+		return
+	}
+
+	s.clientDeviceNamesMu.RLock()
+	seen := map[string]bool{}
+	var uniqueNames []string
+	for _, name := range s.clientDeviceNames {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			uniqueNames = append(uniqueNames, name)
+		}
+	}
+	s.clientDeviceNamesMu.RUnlock()
+
+	var text string
+	switch {
+	case len(uniqueNames) == 1:
+		text = fmt.Sprintf("  \U0001F4F1 %s  ", uniqueNames[0])
+	case len(uniqueNames) > 1:
+		text = fmt.Sprintf("  \U0001F4F1 %d connected  ", len(uniqueNames))
+	case count == 1:
+		text = "  \U0001F4F1 1 phone  "
+	default:
+		text = fmt.Sprintf("  \U0001F4F1 %d phones  ", count)
+	}
+
+	tmux.SetGlobalStatusRight(text)
 }
 
 // snapshotSessions builds a snapshot of all currently-registered sessions.

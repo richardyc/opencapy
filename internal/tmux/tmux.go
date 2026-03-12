@@ -170,6 +170,12 @@ func CapturePaneOutput(sessionName string, lines int, withEscape bool) (string, 
 	return strings.TrimSpace(string(out)), nil
 }
 
+// SetGlobalStatusRight updates the right side of the status bar on every
+// tmux session. Pass an empty string to clear it.
+func SetGlobalStatusRight(text string) {
+	_ = exec.Command(tmuxPath(), "set-option", "-g", "status-right", text).Run()
+}
+
 // SendKeys sends keystrokes to a session pane.
 func SendKeys(sessionName, keys string) error {
 	cmd := exec.Command(tmuxPath(),"send-keys", "-t", sessionName, keys, "Enter")

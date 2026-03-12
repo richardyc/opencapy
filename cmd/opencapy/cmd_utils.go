@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -216,6 +217,7 @@ func newInstallCmd() *cobra.Command {
 				}
 				fmt.Println("LaunchAgent installed and loaded.")
 				fmt.Println("The daemon will start automatically on login.")
+				promptDefaultTerminal()
 				return nil
 			}
 
@@ -226,6 +228,7 @@ func newInstallCmd() *cobra.Command {
 				}
 				fmt.Println("systemd service installed and enabled.")
 				fmt.Println("Start with: sudo systemctl start opencapy")
+				promptDefaultTerminal()
 				return nil
 			}
 
@@ -366,4 +369,81 @@ Add to your editor's settings.json (Cmd+Shift+P → "Open User Settings JSON"):
     "terminal.integrated.defaultProfile.%s": "opencapy"
 
 `, osKey, osKey)
+}
+
+// promptDefaultTerminal asks the user if they want opencapy to auto-start when
+// opening a new terminal window, and patches their shell profile if they agree.
+func promptDefaultTerminal() {
+	fmt.Println()
+	fmt.Print("Make opencapy your default terminal? (auto-attaches tmux on open) [y/N]: ")
+	reader := bufio.NewReader(os.Stdin)
+	answer, _ := reader.ReadString('\n')
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	if answer != "y" && answer != "yes" {
+		return
+	}
+	installDefaultTerminal()
+}
+
+// installDefaultTerminal patches the user's shell profile to auto-launch opencapy
+// whenever a new interactive terminal opens (but not inside tmux, VSCode, or SSH).
+func installDefaultTerminal() {
+	home, _ := os.UserHomeDir()
+
+	// Pick the right profile file(s) based on the current shell.
+	shell := os.Getenv("SHELL")
+	var profiles []string
+	switch {
+	case strings.Contains(shell, "zsh"):
+		profiles = []string{filepath.Join(home, ".zshrc")}
+	case strings.Contains(shell, "bash"):
+		profiles = []string{filepath.Join(home, ".bashrc")}
+		if runtime.GOOS == "darwin" {
+			profiles = append(profiles, filepath.Join(home, ".bash_profile"))
+		}
+	default:
+		// Unknown shell — try both common profiles.
+		profiles = []string{
+			filepath.Join(home, ".zshrc"),
+			filepath.Join(home, ".bashrc"),
+		}
+	}
+
+	const marker = "# opencapy: auto-attach"
+	const snippet = `
+# opencapy: auto-attach to tmux on terminal open
+# Remove this block to disable. Re-run 'opencapy install' to re-add.
+if [ -z "$TMUX" ] && [ -z "$VSCODE_INJECTION" ] && [ -z "$SSH_CONNECTION" ] && [ -t 1 ] && command -v opencapy >/dev/null 2>&1; then
+  exec opencapy
+fi`
+
+	patched := false
+	for _, p := range profiles {
+		// Skip if already installed.
+		data, _ := os.ReadFile(p)
+		if strings.Contains(string(data), marker) {
+			fmt.Printf("  ✓ %s — already configured\n", p)
+			patched = true
+			continue
+		}
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  ✗ %s: %v\n", p, err)
+			continue
+		}
+		_, werr := fmt.Fprintln(f, snippet)
+		f.Close()
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, "  ✗ %s: %v\n", p, werr)
+			continue
+		}
+		fmt.Printf("  ✓ %s — opencapy set as default terminal\n", p)
+		patched = true
+	}
+
+	if patched {
+		fmt.Println()
+		fmt.Println("Restart your terminal (or run: source ~/.zshrc) to activate.")
+		fmt.Println("To undo, remove the '# opencapy: auto-attach' block from your shell profile.")
+	}
 }
