@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -382,10 +383,19 @@ func promptDefaultTerminal() {
 // installDefaultTerminal patches the user's shell profile to auto-launch opencapy
 // whenever a new interactive terminal opens (but not inside tmux, VSCode, or SSH).
 func installDefaultTerminal() {
+	// When run with sudo, target the real user's home and shell, not root's.
 	home, _ := os.UserHomeDir()
+	shell := os.Getenv("SHELL")
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		if u, err := user.Lookup(sudoUser); err == nil {
+			home = u.HomeDir
+			if s := loginShell(u.Username); s != "" {
+				shell = s
+			}
+		}
+	}
 
 	// Pick the right profile file(s) based on the current shell.
-	shell := os.Getenv("SHELL")
 	var profiles []string
 	switch {
 	case strings.Contains(shell, "zsh"):
@@ -440,4 +450,21 @@ fi`
 		fmt.Println("Restart your terminal (or run: source ~/.zshrc) to activate.")
 		fmt.Println("To undo, remove the '# opencapy: auto-attach' block from your shell profile.")
 	}
+}
+
+// loginShell returns the login shell for the given username by reading /etc/passwd.
+func loginShell(username string) string {
+	f, err := os.Open("/etc/passwd")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.SplitN(scanner.Text(), ":", 7)
+		if len(fields) == 7 && fields[0] == username {
+			return fields[6]
+		}
+	}
+	return ""
 }
