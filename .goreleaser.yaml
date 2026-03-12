@@ -45,7 +45,7 @@ brews:
     repository:
       owner: richardyc
       name: homebrew-opencapy
-      token: "{{ .Env.GITHUB_TOKEN }}"
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     commit_author:
       name: opencapy-bot
       email: bot@opencapy.dev
