@@ -8,7 +8,7 @@ OpenCapy is a lightweight daemon + iOS app that lets you monitor and control Cla
 
 ### Mac
 ```bash
-brew tap richardyc/opencapy https://github.com/richardyc/opencapy
+brew tap richardyc/opencapy
 brew install opencapy
 opencapy install   # installs LaunchAgent, auto-starts daemon at login
 ```

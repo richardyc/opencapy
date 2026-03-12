@@ -18,7 +18,7 @@ Users run `opencapy` to create/manage tmux sessions via a bubbletea full-screen 
 - internal/project/ — session->project registry (cwd-locked)
 - internal/config/ — ~/.opencapy/config.json
 - internal/platform/ — OS detection, LaunchAgent/systemd helpers
-- Formula/opencapy.rb — homebrew formula (auto-updated by goreleaser)
+- Formula/opencapy.rb — homebrew formula lives in richardyc/homebrew-opencapy (separate tap repo, auto-updated by goreleaser on release)
 - install/install.sh — Linux curl-install script
 
 ## Key decisions
