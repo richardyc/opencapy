@@ -26,6 +26,21 @@ func newShimCmd() *cobra.Command {
 		// Pass all flags/args through to claude unchanged.
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Write diagnostics to a log file so failures are visible without
+			// polluting the terminal (raw mode makes stderr invisible).
+			logf, _ := os.OpenFile("/tmp/opencapy-shim.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			dbg := func(format string, v ...interface{}) {
+				if logf != nil {
+					fmt.Fprintf(logf, format+"\n", v...)
+				}
+			}
+			defer func() {
+				if logf != nil {
+					logf.Close()
+				}
+			}()
+			dbg("shim started args=%v", args)
+
 			cfg, _ := config.Load()
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -39,26 +54,29 @@ func newShimCmd() *cobra.Command {
 			wsURL := fmt.Sprintf("ws://127.0.0.1:%d/ws", port)
 			conn, _, err := websocket.Dial(ctx, wsURL, nil)
 			if err != nil {
-				// Daemon not running — exec the real claude directly.
+				dbg("ws dial failed: %v — falling back", err)
 				return fallbackExec(args)
 			}
 			defer conn.CloseNow()
+			dbg("ws connected")
 
 			cols, rows, err := term.GetSize(int(os.Stdin.Fd()))
 			if err != nil {
 				cols, rows = 80, 24
 			}
+			dbg("terminal size %dx%d", cols, rows)
 
 			cwd, _ := os.Getwd()
+			dbg("cwd=%q", cwd)
+
 			claudePath, err := findRealClaude()
 			if err != nil {
+				dbg("findRealClaude failed: %v", err)
 				return err
 			}
+			dbg("claudePath=%q", claudePath)
 
-			// Pass the full user shell environment so the daemon can spawn claude
-		// with all the env vars it needs (USER, LANG, npm dirs, API keys, etc.).
-		// Strip CLAUDECODE to prevent the nested-session refusal.
-		spawnMsg := map[string]interface{}{
+			spawnMsg := map[string]interface{}{
 				"type":         "spawn_pty",
 				"args":         append([]string{claudePath}, args...),
 				"project_path": cwd,
@@ -68,13 +86,17 @@ func newShimCmd() *cobra.Command {
 				"env":          filteredEnv(),
 			}
 			if err := wsjson.Write(ctx, conn, spawnMsg); err != nil {
+				dbg("wsjson.Write spawn_pty failed: %v — falling back", err)
 				return fallbackExec(args)
 			}
+			dbg("spawn_pty sent")
 
 			sessionName, err := waitSessionAssigned(ctx, conn)
 			if err != nil {
+				dbg("waitSessionAssigned failed: %v — falling back", err)
 				return fallbackExec(args)
 			}
+			dbg("session assigned: %q", sessionName)
 
 			setTerminalTitle(fmt.Sprintf("claude · %s · running", sessionName))
 
