@@ -39,9 +39,28 @@ export default {
       return new Response('role must be "mac" or "ios"', { status: 400 });
 
     const id = env.RELAY.idFromName(match[1].toLowerCase());
-    return env.RELAY.get(id).fetch(request);
+    // Hint the DO location based on the connecting client's continent so the
+    // room is created close to its users (e.g. "apac" for HK/SG/TYO users).
+    // This is best-effort on first creation; subsequent requests go to the
+    // same DO regardless of origin.
+    const hint = continentToLocationHint((request as any).cf?.continent);
+    return env.RELAY.get(id, hint ? { locationHint: hint } : undefined).fetch(request);
   },
 } satisfies ExportedHandler<Env>;
+
+/** Map Cloudflare continent code → DO location hint. */
+function continentToLocationHint(continent?: string): DurableObjectLocationHint | undefined {
+  switch (continent) {
+    case "AS": return "apac";   // Asia (HK, SG, TYO, …)
+    case "OC": return "apac";   // Oceania → closest is apac
+    case "EU": return "weur";
+    case "AF": return "afr";
+    case "SA": return "sam";
+    case "ME": return "me";
+    case "NA": return "enam";
+    default:   return undefined; // let Cloudflare decide
+  }
+}
 
 // ─── APNs helpers ─────────────────────────────────────────────────────────────
 
