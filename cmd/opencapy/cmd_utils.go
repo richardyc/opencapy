@@ -101,14 +101,19 @@ func newUpdateCmd() *cobra.Command {
 			plistPath := home + "/Library/LaunchAgents/com.opencapy.daemon.plist"
 
 			if platform.IsMacOS() {
+				cfg, _ := config.Load()
+				port := 7242
+				if cfg != nil {
+					port = cfg.Port
+				}
 				if _, err := os.Stat(plistPath); err == nil {
 					exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
+					killAndWait(port)
 					if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
 						return fmt.Errorf("launchctl load: %w", err)
 					}
 				} else {
-					exec.Command("pkill", "-f", "opencapy daemon").Run() //nolint:errcheck
-					time.Sleep(300 * time.Millisecond)
+					killAndWait(port)
 					binaryPath, _ := os.Executable()
 					daemon := exec.Command(binaryPath, "daemon")
 					daemon.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -128,6 +133,22 @@ func newUpdateCmd() *cobra.Command {
 
 			return fmt.Errorf("unsupported platform — restart the daemon manually")
 		},
+	}
+}
+
+// killAndWait kills all running opencapy daemon processes and blocks until the
+// port is free (up to 3s). Prevents "address already in use" when restarting.
+func killAndWait(port int) {
+	exec.Command("pkill", "-f", "opencapy daemon").Run() //nolint:errcheck
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return // port is free
+		}
+		conn.Close()
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -175,6 +196,14 @@ func newInstallCmd() *cobra.Command {
 
 			if platform.IsMacOS() {
 				fmt.Println("Installing LaunchAgent...")
+				cfg, _ := config.Load()
+				port := 7242
+				if cfg != nil {
+					port = cfg.Port
+				}
+				// Kill any running daemon before (re)installing so we never end
+				// up with two instances fighting over the same port.
+				killAndWait(port)
 				if err := platform.InstallLaunchAgent(binaryPath); err != nil {
 					return fmt.Errorf("install LaunchAgent: %w", err)
 				}
