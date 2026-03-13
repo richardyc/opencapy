@@ -502,17 +502,33 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		}()
 
 	case "approve":
-		if msg.Session != "" {
-			// Claude Code permission prompts use number keys. Option 1 is always
-			// "Yes" and fires immediately without Enter.
+		if msg.Session == "" {
+			break
+		}
+		if s.IsDirectSession(msg.Session) {
+			// Send "1" + Enter: navigates to option 1 and confirms.
+			s.forwardToShim(msg.Session, "pty_input", map[string]string{
+				"session": msg.Session,
+				"data":    base64.StdEncoding.EncodeToString([]byte("1\r")),
+			})
+		} else {
 			_ = tmux.SendKeyNoEnter(msg.Session, "1")
+			_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
 		}
 
 	case "deny":
-		if msg.Session != "" {
-			// "No" is always the last option (option 2 or 3 depending on prompt).
-			// Navigate down past all options to land on the last one, then Enter.
-			// Pressing Down past the last item stays there, so 3 Downs is safe.
+		if msg.Session == "" {
+			break
+		}
+		if s.IsDirectSession(msg.Session) {
+			// Down×3 moves past all options to the last one, Enter confirms.
+			// \x1b[B is the Down arrow escape sequence in raw terminal mode.
+			deny := "\x1b[B\x1b[B\x1b[B\r"
+			s.forwardToShim(msg.Session, "pty_input", map[string]string{
+				"session": msg.Session,
+				"data":    base64.StdEncoding.EncodeToString([]byte(deny)),
+			})
+		} else {
 			_ = tmux.SendRawKeys(msg.Session, []string{"Down", "Down", "Down", "Enter"})
 		}
 
