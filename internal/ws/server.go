@@ -72,6 +72,7 @@ type SessionSnapshot struct {
 	Created      time.Time       `json:"created"`
 	LastActive   time.Time       `json:"last_active"`
 	RecentEvents []watcher.Event `json:"recent_events,omitempty"`
+	SessionType  string          `json:"session_type"` // "tmux" or "direct"
 }
 
 // Client represents a connected iOS device.
@@ -1425,6 +1426,7 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 			Created:      sess.Created,
 			LastActive:   sess.LastActive,
 			RecentEvents: recent,
+			SessionType:  "tmux",
 		})
 	}
 
@@ -1441,6 +1443,7 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 			Created:      ds.createdAt,
 			LastActive:   ds.createdAt,
 			RecentEvents: recent,
+			SessionType:  "direct",
 		})
 	}
 	s.directSessionsMu.RUnlock()
