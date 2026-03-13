@@ -278,9 +278,10 @@ func isPathAllowed(path string, reg *project.Registry) bool {
 }
 
 // isListDirAllowed is like isPathAllowed but also permits ancestor directories of
-// registered projects so the iOS folder browser can navigate up to discover new
-// project directories. Listing directory names is low-risk compared to reading
-// file contents, so this broader check is safe for list_dir only.
+// registered projects and the user's home directory subtree, so the iOS folder
+// browser can navigate freely to discover new project directories. Listing
+// directory names is low-risk compared to reading file contents, so this broader
+// check is safe for list_dir only.
 func isListDirAllowed(path string, reg *project.Registry) bool {
 	if isPathAllowed(path, reg) {
 		return true
@@ -288,6 +289,14 @@ func isListDirAllowed(path string, reg *project.Registry) bool {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return false
+	}
+	// Always allow browsing within the user's home directory so the folder
+	// browser works even before any sessions/projects are registered.
+	if home, err := os.UserHomeDir(); err == nil {
+		sep := string(filepath.Separator)
+		if abs == home || strings.HasPrefix(abs, home+sep) {
+			return true
+		}
 	}
 	if reg == nil {
 		return false
