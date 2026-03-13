@@ -60,10 +60,8 @@ type InboundMessage struct {
 	Lines int `json:"lines,omitempty"` // lines of scrollback to capture
 	// Live Activity
 	Machine string `json:"machine,omitempty"` // machine name from iOS for live activity token
-	// spawn_pty (shim → daemon)
-	Args   []string `json:"args,omitempty"`   // command + arguments, e.g. ["claude", "--flag"]
-	Branch string   `json:"branch,omitempty"` // git branch at launch, set by shell function via OPENCAPY_GIT_BRANCH
-	Env    []string `json:"env,omitempty"`    // user's shell environment; used instead of daemon's minimal LaunchAgent env
+	// register_session (shim → daemon): shim owns the PTY, daemon just routes
+	Branch string `json:"branch,omitempty"` // git branch at launch, set by shell function via OPENCAPY_GIT_BRANCH
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -650,19 +648,11 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	// ── PTY messages ──────────────────────────────────────────────────────────
 
-	case "spawn_pty":
-		// Called by the claude shim to create a new direct (non-tmux) session.
-		if s.ptyMgr == nil || len(msg.Args) == 0 || msg.ProjectPath == "" {
+	case "register_session":
+		// Shim owns the PTY — daemon just assigns a name and tracks the session.
+		if msg.ProjectPath == "" {
 			break
 		}
-		cols, rows := msg.Cols, msg.Rows
-		if cols <= 0 {
-			cols = 80
-		}
-		if rows <= 0 {
-			rows = 24
-		}
-		// Generate a human-readable session name: basename + branch (if any) + HH:MM.
 		sessionName := directSessionName(msg.ProjectPath, msg.Branch)
 		s.directSessionsMu.Lock()
 		s.directSessions[sessionName] = &directSessionState{
@@ -675,14 +665,6 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			_ = s.registry.Register(sessionName, msg.ProjectPath)
 			_ = s.registry.Save()
 		}
-		if err := s.ptyMgr.OpenDirect(sessionName, client.ID, cols, rows, msg.ProjectPath, msg.Args, msg.Env); err != nil {
-			log.Printf("spawn_pty %q: %v", sessionName, err)
-			s.directSessionsMu.Lock()
-			delete(s.directSessions, sessionName)
-			s.directSessionsMu.Unlock()
-			break
-		}
-		// Acknowledge with the assigned session name so the shim can display it.
 		ack, _ := json.Marshal(OutboundMessage{
 			Type:    "session_assigned",
 			Payload: map[string]string{"name": sessionName},
@@ -690,6 +672,62 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		select {
 		case client.send <- ack:
 		default:
+		}
+		go s.BroadcastSnapshot()
+
+	case "pty_data":
+		// Shim streams PTY output — buffer it and fan out to iOS subscribers.
+		if msg.Session == "" || msg.Data == "" {
+			break
+		}
+		decoded, err := base64.StdEncoding.DecodeString(msg.Data)
+		if err != nil {
+			break
+		}
+		var subscribers []string
+		s.directSessionsMu.Lock()
+		if ds, ok := s.directSessions[msg.Session]; ok {
+			ds.buf = append(ds.buf, decoded...)
+			if len(ds.buf) > directBufMax {
+				ds.buf = ds.buf[len(ds.buf)-directBufMax:]
+			}
+			subscribers = append([]string(nil), ds.subscribers...)
+		}
+		s.directSessionsMu.Unlock()
+		// Event detection (approval/crash/done) for push notifications.
+		s.sessionWatch.Feed(msg.Session, string(decoded))
+		// Forward to iOS subscribers as pty_output.
+		if len(subscribers) > 0 {
+			outMsg, _ := json.Marshal(OutboundMessage{
+				Type: "pty_output",
+				Payload: map[string]interface{}{
+					"session": msg.Session,
+					"data":    msg.Data, // already base64
+				},
+			})
+			s.mu.RLock()
+			for _, id := range subscribers {
+				if c, ok := s.clients[id]; ok {
+					select {
+					case c.send <- outMsg:
+					default:
+					}
+				}
+			}
+			s.mu.RUnlock()
+		}
+
+	case "session_end":
+		// Shim signals claude has exited.
+		if msg.Session == "" {
+			break
+		}
+		s.directSessionsMu.Lock()
+		delete(s.directSessions, msg.Session)
+		s.directSessionsMu.Unlock()
+		if s.registry != nil {
+			_ = s.registry.Unregister(msg.Session)
+			_ = s.registry.Save()
 		}
 		go s.BroadcastSnapshot()
 
@@ -768,7 +806,19 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		}
 
 	case "pty_input":
-		if s.ptyMgr == nil || msg.Session == "" || msg.Data == "" {
+		if msg.Session == "" || msg.Data == "" {
+			break
+		}
+		// Direct session: forward to the shim that owns the PTY.
+		if s.IsDirectSession(msg.Session) {
+			s.forwardToShim(msg.Session, "pty_input", map[string]string{
+				"session": msg.Session,
+				"data":    msg.Data,
+			})
+			break
+		}
+		// tmux session: write directly to the grouped PTY.
+		if s.ptyMgr == nil {
 			break
 		}
 		decoded, err := base64.StdEncoding.DecodeString(msg.Data)
@@ -776,17 +826,28 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			log.Printf("pty_input decode: %v", err)
 			break
 		}
-		log.Printf("pty_input %q: %d bytes %v", msg.Session, len(decoded), decoded)
 		if err := s.ptyMgr.Write(msg.Session, decoded); err != nil {
 			log.Printf("pty_input write %q: %v", msg.Session, err)
 		}
 
 	case "pty_resize":
-		if s.ptyMgr == nil || msg.Session == "" {
+		if msg.Session == "" {
 			break
 		}
 		cols, rows := msg.Cols, msg.Rows
 		if cols <= 0 || rows <= 0 {
+			break
+		}
+		// Direct session: forward resize to shim (shim calls pty.Setsize).
+		if s.IsDirectSession(msg.Session) {
+			s.forwardToShim(msg.Session, "pty_resize", map[string]int{
+				"cols": cols,
+				"rows": rows,
+			})
+			break
+		}
+		// tmux session: resize the grouped PTY.
+		if s.ptyMgr == nil {
 			break
 		}
 		if err := s.ptyMgr.Resize(msg.Session, cols, rows); err != nil {
@@ -1224,39 +1285,12 @@ func (s *Server) BroadcastSnapshot() {
 	}
 }
 
-// SendPTYOutput sends pty_output to the shim that owns the session, and for direct
-// sessions also forwards to any iOS clients subscribed via open_pty.
-// A nil Data slice signals process exit — the direct session is deregistered.
+// SendPTYOutput sends pty_output to the iOS client that owns this tmux PTY session.
+// Direct sessions stream via pty_data messages instead — this is tmux-only.
 func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
-	// nil Data = process exited; deregister direct session and broadcast.
 	if out.Data == nil {
-		if s.IsDirectSession(out.Session) {
-			s.directSessionsMu.Lock()
-			delete(s.directSessions, out.Session)
-			s.directSessionsMu.Unlock()
-			if s.registry != nil {
-				_ = s.registry.Unregister(out.Session)
-				_ = s.registry.Save()
-			}
-			go s.BroadcastSnapshot()
-		}
 		return
 	}
-
-	// Append to ring buffer for direct sessions and collect subscriber list.
-	var subscribers []string
-	if s.IsDirectSession(out.Session) {
-		s.directSessionsMu.Lock()
-		if ds, ok := s.directSessions[out.Session]; ok {
-			ds.buf = append(ds.buf, out.Data...)
-			if len(ds.buf) > directBufMax {
-				ds.buf = ds.buf[len(ds.buf)-directBufMax:]
-			}
-			subscribers = append([]string(nil), ds.subscribers...)
-		}
-		s.directSessionsMu.Unlock()
-	}
-
 	msg := OutboundMessage{
 		Type: "pty_output",
 		Payload: map[string]interface{}{
@@ -1268,30 +1302,42 @@ func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
 	if err != nil {
 		return
 	}
-
-	// Send to shim owner.
 	s.mu.RLock()
-	owner, ok := s.clients[out.ClientID]
+	c, ok := s.clients[out.ClientID]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	select {
+	case c.send <- data:
+	default:
+	}
+}
+
+// forwardToShim sends a message to the shim that owns the given direct session.
+func (s *Server) forwardToShim(session, msgType string, payload interface{}) {
+	s.directSessionsMu.RLock()
+	ds, ok := s.directSessions[session]
+	shimID := ""
+	if ok {
+		shimID = ds.shimClientID
+	}
+	s.directSessionsMu.RUnlock()
+	if shimID == "" {
+		return
+	}
+	data, err := json.Marshal(OutboundMessage{Type: msgType, Payload: payload})
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	c, ok := s.clients[shimID]
 	s.mu.RUnlock()
 	if ok {
 		select {
-		case owner.send <- data:
+		case c.send <- data:
 		default:
 		}
-	}
-
-	// Also forward to iOS subscribers (direct sessions only).
-	if len(subscribers) > 0 {
-		s.mu.RLock()
-		for _, id := range subscribers {
-			if c, ok := s.clients[id]; ok {
-				select {
-				case c.send <- data:
-				default:
-				}
-			}
-		}
-		s.mu.RUnlock()
 	}
 }
 

@@ -104,9 +104,7 @@ func newDaemonCmd() *cobra.Command {
 			// Start WebSocket server
 			srv := ws.New(cfg.Port, w, reg, pushReg, ptyMgr)
 
-			// Forward PTY output events to the owning WebSocket client.
-			// For direct (non-tmux) sessions also feed output into the watcher
-			// so event detection (approval/crash/done) works without tmux polling.
+			// Forward tmux PTY output events to the owning iOS client.
 			go func() {
 				for {
 					select {
@@ -114,9 +112,6 @@ func newDaemonCmd() *cobra.Command {
 						return
 					case out := <-ptyMgr.Events():
 						srv.SendPTYOutput(out)
-						if out.Data != nil && srv.IsDirectSession(out.Session) {
-							w.Feed(out.Session, string(out.Data))
-						}
 					}
 				}
 			}()

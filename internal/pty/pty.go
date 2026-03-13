@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 
 	"github.com/creack/pty"
@@ -179,91 +178,6 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir st
 	return nil
 }
 
-// OpenDirect spawns an arbitrary command inside a PTY without any tmux involvement.
-// Used by the claude shim so the daemon can stream output to iOS without tmux.
-func (m *Manager) OpenDirect(sessionName, clientID string, cols, rows int, cwd string, args []string, shimEnv []string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.sessions[sessionName]; exists {
-		return fmt.Errorf("pty session %q already open", sessionName)
-	}
-
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Dir = cwd
-
-	// Use the shim's environment (full user shell env) when provided.
-	// Fall back to the daemon's own env if not — the daemon runs as a
-	// LaunchAgent with a minimal env (PATH, TMPDIR, HOME only), which is
-	// not sufficient for running claude (missing USER, LANG, npm dirs, etc.).
-	// Either way, strip CLAUDECODE to prevent the "nested session" refusal.
-	baseEnv := shimEnv
-	if len(baseEnv) == 0 {
-		baseEnv = os.Environ()
-	}
-	env := make([]string, 0, len(baseEnv)+4)
-	for _, e := range baseEnv {
-		if !strings.HasPrefix(e, "CLAUDECODE=") {
-			env = append(env, e)
-		}
-	}
-	cmd.Env = append(env,
-		"TERM=xterm-256color",
-		"LANG=en_US.UTF-8",
-		"LC_ALL=en_US.UTF-8",
-		"LC_CTYPE=en_US.UTF-8",
-	)
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	})
-	if err != nil {
-		return fmt.Errorf("start direct pty for %q: %w", sessionName, err)
-	}
-
-	sess := &PTYSession{
-		sessionName: sessionName,
-		groupName:   "", // empty = direct session; no tmux cleanup on close
-		ptmx:        ptmx,
-		cmd:         cmd,
-		clientID:    clientID,
-	}
-	m.sessions[sessionName] = sess
-
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			n, err := ptmx.Read(buf)
-			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buf[:n])
-				select {
-				case m.events <- PTYOutput{Session: sessionName, ClientID: clientID, Data: chunk}:
-				default:
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-		_ = sess.cmd.Wait()
-		_ = sess.ptmx.Close()
-		m.mu.Lock()
-		if m.sessions[sessionName] == sess {
-			delete(m.sessions, sessionName)
-		}
-		m.mu.Unlock()
-		// Signal that the process exited by sending a zero-length PTYOutput.
-		// The server uses this to deregister the direct session.
-		select {
-		case m.events <- PTYOutput{Session: sessionName, ClientID: clientID, Data: nil}:
-		default:
-		}
-	}()
-
-	return nil
-}
-
 // Write sends bytes to the PTY stdin of the named session.
 func (m *Manager) Write(sessionName string, data []byte) error {
 	m.mu.Lock()
@@ -307,9 +221,7 @@ func (m *Manager) Close(sessionName string) {
 	if sess.cmd.Process != nil {
 		sess.cmd.Process.Kill()
 	}
-	if sess.groupName != "" {
-		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
-	}
+	_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
 }
 
 // CloseByClient closes and removes all PTY sessions owned by the given clientID.
@@ -334,8 +246,6 @@ func (m *Manager) CloseByClient(clientID string) {
 		if sess.cmd.Process != nil {
 			sess.cmd.Process.Kill()
 		}
-		if sess.groupName != "" {
-			_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
-		}
+		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
 	}
 }
