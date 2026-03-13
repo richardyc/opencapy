@@ -218,6 +218,9 @@ func newInstallCmd() *cobra.Command {
 			fmt.Println()
 			fmt.Println("Done! Open a new terminal, then run: claude")
 			fmt.Println("To pair your iPhone:  opencapy qr")
+			fmt.Println()
+			fmt.Println("VS Code/Cursor: add to settings.json for accurate tab titles:")
+			fmt.Println(`  "terminal.integrated.tabs.title": "${sequence}"`)
 			return nil
 		},
 	}
