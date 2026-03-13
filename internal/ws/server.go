@@ -63,6 +63,7 @@ type InboundMessage struct {
 	// spawn_pty (shim → daemon)
 	Args   []string `json:"args,omitempty"`   // command + arguments, e.g. ["claude", "--flag"]
 	Branch string   `json:"branch,omitempty"` // git branch at launch, set by shell function via OPENCAPY_GIT_BRANCH
+	Env    []string `json:"env,omitempty"`    // user's shell environment; used instead of daemon's minimal LaunchAgent env
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -674,7 +675,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			_ = s.registry.Register(sessionName, msg.ProjectPath)
 			_ = s.registry.Save()
 		}
-		if err := s.ptyMgr.OpenDirect(sessionName, client.ID, cols, rows, msg.ProjectPath, msg.Args); err != nil {
+		if err := s.ptyMgr.OpenDirect(sessionName, client.ID, cols, rows, msg.ProjectPath, msg.Args, msg.Env); err != nil {
 			log.Printf("spawn_pty %q: %v", sessionName, err)
 			s.directSessionsMu.Lock()
 			delete(s.directSessions, sessionName)

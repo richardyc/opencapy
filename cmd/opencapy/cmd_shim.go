@@ -55,13 +55,17 @@ func newShimCmd() *cobra.Command {
 				return err
 			}
 
-			spawnMsg := map[string]interface{}{
+			// Pass the full user shell environment so the daemon can spawn claude
+		// with all the env vars it needs (USER, LANG, npm dirs, API keys, etc.).
+		// Strip CLAUDECODE to prevent the nested-session refusal.
+		spawnMsg := map[string]interface{}{
 				"type":         "spawn_pty",
 				"args":         append([]string{claudePath}, args...),
 				"project_path": cwd,
 				"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
 				"cols":         cols,
 				"rows":         rows,
+				"env":          filteredEnv(),
 			}
 			if err := wsjson.Write(ctx, conn, spawnMsg); err != nil {
 				return fallbackExec(args)

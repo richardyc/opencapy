@@ -181,7 +181,7 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir st
 
 // OpenDirect spawns an arbitrary command inside a PTY without any tmux involvement.
 // Used by the claude shim so the daemon can stream output to iOS without tmux.
-func (m *Manager) OpenDirect(sessionName, clientID string, cols, rows int, cwd string, args []string) error {
+func (m *Manager) OpenDirect(sessionName, clientID string, cols, rows int, cwd string, args []string, shimEnv []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -191,11 +191,18 @@ func (m *Manager) OpenDirect(sessionName, clientID string, cols, rows int, cwd s
 
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = cwd
-	// Build environment from the daemon's env, stripping CLAUDECODE so that
-	// claude does not refuse to start with "nested session" error when the
-	// daemon process itself was launched inside a Claude Code session.
-	env := make([]string, 0, len(os.Environ())+4)
-	for _, e := range os.Environ() {
+
+	// Use the shim's environment (full user shell env) when provided.
+	// Fall back to the daemon's own env if not — the daemon runs as a
+	// LaunchAgent with a minimal env (PATH, TMPDIR, HOME only), which is
+	// not sufficient for running claude (missing USER, LANG, npm dirs, etc.).
+	// Either way, strip CLAUDECODE to prevent the "nested session" refusal.
+	baseEnv := shimEnv
+	if len(baseEnv) == 0 {
+		baseEnv = os.Environ()
+	}
+	env := make([]string, 0, len(baseEnv)+4)
+	for _, e := range baseEnv {
 		if !strings.HasPrefix(e, "CLAUDECODE=") {
 			env = append(env, e)
 		}
