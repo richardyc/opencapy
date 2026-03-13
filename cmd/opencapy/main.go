@@ -15,35 +15,68 @@ var (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "opencapy [name]",
-		Short: "Your machines, mirrored. Code from anywhere.",
-		Long:  "OpenCapy — tmux session manager with iOS mirroring via WebSocket.",
+		Use:   "opencapy",
+		Short: "Monitor your Claude sessions from iOS",
+		Long:  "OpenCapy — run claude in any terminal and monitor it from your iPhone.\nGet started: opencapy install",
 		Args:  cobra.MaximumNArgs(1),
 		RunE:  runRoot,
 	}
 
-	rootCmd.AddCommand(
-		newLsCmd(),
-		newNewCmd(),
-		newHereCmd(),
-		newAttachCmd(),
-		newKillCmd(),
-		newApproveCmd(),
-		newDenyCmd(),
-		newStatusCmd(),
-		newDaemonCmd(),
-		newQRCmd(),
-		newInstallCmd(),
-		newUpdateCmd(),
-		newShimCmd(),
-		newInitCmd(),
-		&cobra.Command{
-			Use:   "version",
-			Short: "Print version info",
-			Run: func(cmd *cobra.Command, args []string) {
-				fmt.Printf("opencapy %s (commit %s, built %s)\n", version, commit, date)
-			},
+	// Hide the auto-generated completion command — not relevant for our users.
+	rootCmd.CompletionOptions.HiddenDefaultCmd = true
+
+	// Grouped help output.
+	rootCmd.AddGroup(
+		&cobra.Group{ID: "setup", Title: "Setup:"},
+		&cobra.Group{ID: "run", Title: "Run:"},
+		&cobra.Group{ID: "tmux", Title: "tmux (optional):"},
+	)
+
+	// Setup group
+	installCmd := newInstallCmd()
+	installCmd.GroupID = "setup"
+	initCmd := newInitCmd()
+	initCmd.GroupID = "setup"
+	qrCmd := newQRCmd()
+	qrCmd.GroupID = "setup"
+
+	// Run group
+	daemonCmd := newDaemonCmd()
+	daemonCmd.GroupID = "run"
+	statusCmd := newStatusCmd()
+	statusCmd.GroupID = "run"
+	updateCmd := newUpdateCmd()
+	updateCmd.GroupID = "run"
+	versionCmd := &cobra.Command{
+		Use:     "version",
+		Short:   "Print version info",
+		GroupID: "run",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("opencapy %s (commit %s, built %s)\n", version, commit, date)
 		},
+	}
+
+	// tmux group
+	newCmd := newNewCmd()
+	newCmd.GroupID = "tmux"
+	attachCmd := newAttachCmd()
+	attachCmd.GroupID = "tmux"
+	killCmd := newKillCmd()
+	killCmd.GroupID = "tmux"
+	approveCmd := newApproveCmd()
+	approveCmd.GroupID = "tmux"
+	denyCmd := newDenyCmd()
+	denyCmd.GroupID = "tmux"
+
+	rootCmd.AddCommand(
+		// Setup
+		installCmd, initCmd, qrCmd,
+		// Run
+		daemonCmd, statusCmd, updateCmd, versionCmd,
+		// tmux
+		newCmd, attachCmd, killCmd, approveCmd, denyCmd,
+		// Hidden — invoked by the claude shell function
+		newShimCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {

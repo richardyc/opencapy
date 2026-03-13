@@ -82,55 +82,10 @@ func createSession(name, cwd string) error {
 	return tmux.Attach(name)
 }
 
-// newHereCmd is the non-interactive create command used in editor terminal profiles
-// (VSCode, Cursor). Always creates a FRESH session so each "New Terminal" tab gets
-// its own session. Names: base, base-2, base-3, …
-func newHereCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "here",
-		Short: "Create a new session for the current directory (for editor integration)",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ensureDaemon()
-			cwd, err := os.Getwd()
-			if err != nil {
-				return fmt.Errorf("get working directory: %w", err)
-			}
-			base := filepath.Base(cwd)
-			name := base
-			for i := 2; ; i++ {
-				exists, err := tmux.SessionExists(name)
-				if err != nil {
-					return fmt.Errorf("check session: %w", err)
-				}
-				if !exists {
-					break
-				}
-				name = fmt.Sprintf("%s-%d", base, i)
-			}
-			return createSession(name, cwd)
-		},
-	}
-}
-
-func newLsCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "ls",
-		Short: "Interactive session manager (same as running opencapy with no args)",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ensureDaemon()
-			cwd, err := os.Getwd()
-			if err != nil {
-				return fmt.Errorf("get working directory: %w", err)
-			}
-			return runTUI(cwd)
-		},
-	}
-}
-
 func newNewCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "new [name]",
-		Short: "Create a new session (name defaults to current directory)",
+		Short: "Create a new tmux session (name defaults to current directory)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ensureDaemon()
@@ -157,7 +112,7 @@ func newNewCmd() *cobra.Command {
 func newAttachCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "attach <name>",
-		Short: "Attach to a tmux session",
+		Short: "Attach to an existing tmux session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return tmux.Attach(args[0])
@@ -168,7 +123,7 @@ func newAttachCmd() *cobra.Command {
 func newKillCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "kill <name>",
-		Short: "Kill a tmux session",
+		Short: "Kill a tmux session by name",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
