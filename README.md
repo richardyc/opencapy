@@ -161,7 +161,48 @@ The daemon exposes a WebSocket server on port 7242.
 
 ## APNs push notifications
 
-Push notifications require an Apple Developer account ($99/yr). Configure in `~/.opencapy/config.json`:
+Push notifications (lock screen alerts when app is backgrounded) require an Apple Developer
+account ($99/yr) and a one-time credential setup.
+
+### Getting your credentials
+
+1. Sign in to [developer.apple.com](https://developer.apple.com) → **Certificates, Identifiers & Profiles → Keys**
+2. Click **+** → enable **Apple Push Notifications service (APNs)** → Continue → Register
+3. **Download** the `.p8` file (only available once — save it somewhere safe)
+4. Note the **Key ID** (10 chars) shown next to the key
+5. Your **Team ID** (10 chars) is shown in the top-right corner of the developer portal
+
+### Option A — Relay mode (recommended, zero per-user config)
+
+If you deploy the relay, store credentials as Cloudflare secrets once:
+
+```bash
+cd relay
+wrangler secret put APNS_KEY_P8    # paste the full .p8 file content
+wrangler secret put APNS_KEY_ID    # e.g. ABC1234DEF
+wrangler secret put APNS_TEAM_ID   # e.g. XYZ9876543
+wrangler deploy
+```
+
+The relay then pushes Live Activity updates directly from Cloudflare — users configure nothing.
+
+### Option B — Direct mode (Tailscale / SSH, embedded at build time)
+
+For direct connections that bypass the relay, bake credentials into the daemon binary:
+
+```bash
+cp internal/push/credentials_release.go.template \
+   internal/push/credentials_release.go
+# Edit credentials_release.go — fill in KeyID, TeamID, paste .p8 content
+go build -tags release ./...
+```
+
+`credentials_release.go` is gitignored. Release binaries (e.g. Homebrew) should be built
+with `-tags release` so end users install a binary that just works.
+
+### Option C — config.json (advanced / self-hosted)
+
+Configure per-machine in `~/.opencapy/config.json`:
 
 ```json
 {
@@ -171,14 +212,14 @@ Push notifications require an Apple Developer account ($99/yr). Configure in `~/
     "key_id": "XXXXXXXXXX",
     "team_id": "YYYYYYYYYY",
     "bundle_id": "dev.opencapy.app",
-    "production": false
+    "production": true
   }
 }
 ```
 
-Without this config the daemon runs fine — push notifications are disabled, all other features work.
+Without any of the above, the daemon runs fine — push notifications are disabled, all other features work.
 
-Notifications are only sent when no iOS clients are connected (i.e. app is backgrounded):
+Notifications fire when no iOS client is connected (app backgrounded):
 - **Approval needed** — Claude Code is waiting for your input
 - **Session crashed** — with error detail
 - **Task complete** — Claude Code finished
