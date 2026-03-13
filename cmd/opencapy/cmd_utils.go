@@ -116,6 +116,7 @@ func newUpdateCmd() *cobra.Command {
 					killAndWait(port)
 					binaryPath, _ := os.Executable()
 					daemon := exec.Command(binaryPath, "daemon")
+					daemon.Env = filteredEnv()
 					daemon.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 					if err := daemon.Start(); err != nil {
 						return fmt.Errorf("start daemon: %w", err)
@@ -190,36 +191,74 @@ func newInstallCmd() *cobra.Command {
 				return fmt.Errorf("find binary path: %w", err)
 			}
 
-			if _, err := exec.LookPath("tmux"); err != nil {
-				fmt.Println("ℹ tmux not found — that's fine, sessions run via the claude shell hook")
-			}
-
 			if platform.IsMacOS() {
-				fmt.Println("Installing LaunchAgent...")
 				cfg, _ := config.Load()
 				port := 7242
 				if cfg != nil {
 					port = cfg.Port
 				}
-				// Kill any running daemon before (re)installing so we never end
-				// up with two instances fighting over the same port.
+				// Kill any stale daemon first so launchctl load gets a clean start.
 				killAndWait(port)
 				if err := platform.InstallLaunchAgent(binaryPath); err != nil {
 					return fmt.Errorf("install LaunchAgent: %w", err)
 				}
-				fmt.Println("LaunchAgent installed. Daemon will start automatically on login.")
+				fmt.Println("✓ Daemon installed — starts automatically on login")
 			} else if platform.IsLinux() {
-				fmt.Println("Installing systemd service...")
 				if err := platform.InstallSystemd(binaryPath); err != nil {
 					return fmt.Errorf("install systemd: %w", err)
 				}
-				fmt.Println("systemd service installed. Start with: sudo systemctl start opencapy")
+				fmt.Println("✓ Daemon installed (systemd)")
+				fmt.Println("  Start now: sudo systemctl start opencapy")
 			} else {
 				return fmt.Errorf("unsupported platform")
 			}
 
-			fmt.Println()
 			injectShellIntegration()
+
+			fmt.Println()
+			fmt.Println("Done! Open a new terminal, then run: claude")
+			fmt.Println("To pair your iPhone:  opencapy qr")
+			return nil
+		},
+	}
+}
+
+func newUninstallCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "uninstall",
+		Short: "Remove opencapy daemon service and shell hook",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			home, _ := os.UserHomeDir()
+
+			// Stop and remove LaunchAgent / systemd service.
+			plistPath := home + "/Library/LaunchAgents/com.opencapy.daemon.plist"
+			if _, err := os.Stat(plistPath); err == nil {
+				exec.Command("launchctl", "unload", plistPath).Run() //nolint:errcheck
+				os.Remove(plistPath)
+				fmt.Println("✓ LaunchAgent removed")
+			}
+			unitPath := "/etc/systemd/system/opencapy.service"
+			if _, err := os.Stat(unitPath); err == nil {
+				exec.Command("sudo", "systemctl", "disable", "--now", "opencapy").Run() //nolint:errcheck
+				os.Remove(unitPath)
+				fmt.Println("✓ systemd service removed")
+			}
+
+			// Kill any running daemon.
+			cfg, _ := config.Load()
+			port := 7242
+			if cfg != nil {
+				port = cfg.Port
+			}
+			killAndWait(port)
+			fmt.Println("✓ Daemon stopped")
+
+			// Remove shell integration.
+			removeShellIntegration(home)
+
+			fmt.Println()
+			fmt.Println("opencapy uninstalled. Your claude installation is unchanged.")
+			fmt.Println("To remove the binary: brew uninstall opencapy")
 			return nil
 		},
 	}

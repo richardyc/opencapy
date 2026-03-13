@@ -144,3 +144,58 @@ func alreadyInjected(path string) bool {
 	}
 	return strings.Contains(string(data), shellSentinelStart)
 }
+
+// removeShellIntegration removes the opencapy sentinel block from all shell
+// config files and the fish function file.
+func removeShellIntegration(home string) {
+	removed := false
+	// zsh / bash RC files
+	for _, p := range []string{
+		filepath.Join(home, ".zshrc"),
+		filepath.Join(home, ".bash_profile"),
+		filepath.Join(home, ".bashrc"),
+	} {
+		if removeSentinelBlock(p) {
+			fmt.Printf("✓ Shell hook removed from %s\n", p)
+			removed = true
+		}
+	}
+	// fish function file
+	fishFunc := filepath.Join(home, ".config", "fish", "functions", "claude.fish")
+	if _, err := os.Stat(fishFunc); err == nil {
+		os.Remove(fishFunc)
+		fmt.Printf("✓ Fish function removed (%s)\n", fishFunc)
+		removed = true
+	}
+	if !removed {
+		fmt.Println("  No shell hook found (already clean)")
+	}
+}
+
+// removeSentinelBlock removes the >>> opencapy >>> ... <<< opencapy <<< block
+// from a shell RC file. Returns true if something was removed.
+func removeSentinelBlock(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	start := strings.Index(content, shellSentinelStart)
+	if start == -1 {
+		return false
+	}
+	end := strings.Index(content, shellSentinelEnd)
+	if end == -1 {
+		return false
+	}
+	end += len(shellSentinelEnd)
+	// Trim the surrounding newline so we don't leave a blank line.
+	if start > 0 && content[start-1] == '\n' {
+		start--
+	}
+	if end < len(content) && content[end] == '\n' {
+		end++
+	}
+	cleaned := content[:start] + content[end:]
+	return os.WriteFile(path, []byte(cleaned), 0o644) == nil
+}

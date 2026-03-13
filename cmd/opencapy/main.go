@@ -35,6 +35,8 @@ func main() {
 	// Setup group
 	installCmd := newInstallCmd()
 	installCmd.GroupID = "setup"
+	uninstallCmd := newUninstallCmd()
+	uninstallCmd.GroupID = "setup"
 	initCmd := newInitCmd()
 	initCmd.GroupID = "setup"
 	qrCmd := newQRCmd()
@@ -70,7 +72,7 @@ func main() {
 
 	rootCmd.AddCommand(
 		// Setup
-		installCmd, initCmd, qrCmd,
+		installCmd, uninstallCmd, initCmd, qrCmd,
 		// Run
 		daemonCmd, statusCmd, updateCmd, versionCmd,
 		// tmux

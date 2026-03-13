@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/richardyc/opencapy/internal/config"
@@ -16,6 +17,8 @@ import (
 )
 
 // ensureDaemon checks if the daemon is running and starts it in the background if not.
+// Strips CLAUDECODE from the daemon's environment so it can spawn claude sessions
+// even when ensureDaemon is called from inside a Claude Code session.
 func ensureDaemon() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -32,12 +35,25 @@ func ensureDaemon() {
 		self = "opencapy"
 	}
 	proc := exec.Command(self, "daemon")
+	proc.Env = filteredEnv()
 	proc.Stdout = nil
 	proc.Stderr = nil
 	if err := proc.Start(); err == nil {
 		fmt.Println("→ daemon started in background (port", cfg.Port, ")")
 		time.Sleep(300 * time.Millisecond)
 	}
+}
+
+// filteredEnv returns os.Environ() with CLAUDECODE removed so daemon processes
+// can spawn claude without triggering the "nested session" guard.
+func filteredEnv() []string {
+	env := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "CLAUDECODE=") {
+			env = append(env, e)
+		}
+	}
+	return env
 }
 
 // runRoot is the default command: interactive chooser (no args) or attach-only (with name).

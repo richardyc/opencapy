@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/creack/pty"
@@ -190,7 +191,16 @@ func (m *Manager) OpenDirect(sessionName, clientID string, cols, rows int, cwd s
 
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(),
+	// Build environment from the daemon's env, stripping CLAUDECODE so that
+	// claude does not refuse to start with "nested session" error when the
+	// daemon process itself was launched inside a Claude Code session.
+	env := make([]string, 0, len(os.Environ())+4)
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "CLAUDECODE=") {
+			env = append(env, e)
+		}
+	}
+	cmd.Env = append(env,
 		"TERM=xterm-256color",
 		"LANG=en_US.UTF-8",
 		"LC_ALL=en_US.UTF-8",
