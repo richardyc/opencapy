@@ -684,6 +684,14 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			createdAt:    time.Now(),
 		}
 		s.directSessionsMu.Unlock()
+		// Suppress structured event detection for 2s on first connect.
+		// The initial pty_data stream replays the full terminal scrollback from
+		// top to bottom — historical content (e.g. a previously-resolved trust
+		// folder prompt buried in history) would trigger false approvals without
+		// this guard. Same mechanism as the pty_resize suppression.
+		s.directResizeMu.Lock()
+		s.directResizeAt[sessionName] = time.Now().Add(time.Second) // 2s total window
+		s.directResizeMu.Unlock()
 		if s.registry != nil {
 			_ = s.registry.Register(sessionName, msg.ProjectPath)
 			_ = s.registry.Save()
