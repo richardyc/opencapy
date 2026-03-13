@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -124,7 +125,9 @@ func newShimCmd() *cobra.Command {
 					if n > 0 {
 						chunk := make([]byte, n)
 						copy(chunk, buf[:n])
-						os.Stdout.Write(chunk) //nolint:errcheck
+						// Strip claude's OSC title sequences so our session-name
+						// title persists and is never overridden.
+						os.Stdout.Write(oscTitleRe.ReplaceAll(chunk, nil)) //nolint:errcheck
 						_ = wsjson.Write(ctx, conn, map[string]interface{}{
 							"type":    "pty_data",
 							"session": sessionName,
@@ -246,6 +249,11 @@ func updateTitleFromEvent(sessionName string, payloadRaw json.RawMessage) {
 func setTerminalTitle(title string) {
 	fmt.Fprintf(os.Stderr, "\033]0;%s\007", title)
 }
+
+// oscTitleRe matches OSC 0/1/2 title-setting sequences that programs like
+// claude emit to set the terminal window/tab title. We strip these so the
+// shim's own title (showing the session name) is never overridden.
+var oscTitleRe = regexp.MustCompile(`\x1b][012];[^\x07]*\x07`)
 
 // findRealClaude locates the real claude binary, skipping ~/.opencapy paths
 // to prevent recursion if any old shim files are still present on disk.

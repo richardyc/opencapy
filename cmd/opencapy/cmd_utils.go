@@ -258,6 +258,12 @@ func newUninstallCmd() *cobra.Command {
 
 			fmt.Println()
 			fmt.Println("opencapy uninstalled. Your claude installation is unchanged.")
+			fmt.Println()
+			fmt.Println("Remaining (your data — safe to delete manually if wanted):")
+			if h, err := os.UserHomeDir(); err == nil {
+				fmt.Printf("  %s  (relay token, config, session registry)\n", h+"/.opencapy")
+			}
+			fmt.Println()
 			fmt.Println("To remove the binary: brew uninstall opencapy")
 			return nil
 		},

@@ -56,8 +56,28 @@ func filteredEnv() []string {
 	return env
 }
 
+// tmuxRequired prints a helpful message and returns an error when tmux is
+// unavailable. All TUI/session commands that need tmux call this first.
+func tmuxRequired() error {
+	if _, err := exec.LookPath("tmux"); err == nil {
+		return nil
+	}
+	fmt.Println("This command requires tmux, which is not installed.")
+	fmt.Println()
+	fmt.Println("To monitor Claude sessions without tmux, just run:  claude")
+	fmt.Println()
+	fmt.Println("To install tmux:")
+	fmt.Println("  macOS:  brew install tmux")
+	fmt.Println("  Ubuntu: sudo apt install tmux")
+	fmt.Println("  Arch:   sudo pacman -S tmux")
+	return fmt.Errorf("tmux not found")
+}
+
 // runRoot is the default command: interactive chooser (no args) or attach-only (with name).
 func runRoot(cmd *cobra.Command, args []string) error {
+	if err := tmuxRequired(); err != nil {
+		return nil // message already printed, exit cleanly
+	}
 	ensureDaemon()
 
 	cwd, err := os.Getwd()
@@ -104,6 +124,7 @@ func newNewCmd() *cobra.Command {
 		Short: "Create a new tmux session (name defaults to current directory)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := tmuxRequired(); err != nil { return err }
 			ensureDaemon()
 			cwd, err := os.Getwd()
 			if err != nil {
@@ -131,6 +152,7 @@ func newAttachCmd() *cobra.Command {
 		Short: "Attach to an existing tmux session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := tmuxRequired(); err != nil { return err }
 			return tmux.Attach(args[0])
 		},
 	}
@@ -142,6 +164,7 @@ func newKillCmd() *cobra.Command {
 		Short: "Kill a tmux session by name",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := tmuxRequired(); err != nil { return err }
 			name := args[0]
 			if err := tmux.KillSession(name); err != nil {
 				return fmt.Errorf("kill session: %w", err)
@@ -162,6 +185,7 @@ func newApproveCmd() *cobra.Command {
 		Short: "Send approval keystroke to a session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := tmuxRequired(); err != nil { return err }
 			return tmux.SendKeys(args[0], "y")
 		},
 	}
@@ -173,6 +197,7 @@ func newDenyCmd() *cobra.Command {
 		Short: "Send deny keystroke to a session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := tmuxRequired(); err != nil { return err }
 			return tmux.SendKeys(args[0], "n")
 		},
 	}
