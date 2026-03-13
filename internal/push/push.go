@@ -1,6 +1,7 @@
 package push
 
 import (
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -119,23 +120,39 @@ func (r *Registry) save() error {
 }
 
 // InitAPNs loads the .p8 key and initialises the APNs client.
-// If the key file is missing or config is empty, it logs a note and falls back to stub.
+// Prefers config.json values; falls back to credentials embedded at build time
+// (build with -tags release and a credentials_release.go file).
 func (r *Registry) InitAPNs(cfg config.APNsConfig) error {
-	if cfg.KeyPath == "" || cfg.KeyID == "" || cfg.TeamID == "" {
+	// Resolve key source: file path > embedded constant
+	keyID, teamID := cfg.KeyID, cfg.TeamID
+	if (keyID == "" || teamID == "") && embeddedKeyID != "" {
+		keyID, teamID = embeddedKeyID, embeddedTeamID
+		cfg.Production = true
+		log.Println("[push] using embedded APNs credentials")
+	}
+	if (cfg.KeyPath == "" && embeddedKeyP8 == "") || keyID == "" || teamID == "" {
 		log.Println("[push] APNs config incomplete — running in stub mode")
 		return nil
 	}
 
-	authKey, err := token.AuthKeyFromFile(cfg.KeyPath)
+	var (
+		ecKey *ecdsa.PrivateKey
+		err   error
+	)
+	if cfg.KeyPath != "" {
+		ecKey, err = token.AuthKeyFromFile(cfg.KeyPath)
+	} else {
+		ecKey, err = token.AuthKeyFromBytes([]byte(embeddedKeyP8))
+	}
 	if err != nil {
 		log.Printf("[push] APNs key load failed (%v) — running in stub mode", err)
-		return nil // graceful fallback, not an error
+		return nil
 	}
 
 	t := &token.Token{
-		AuthKey: authKey,
-		KeyID:   cfg.KeyID,
-		TeamID:  cfg.TeamID,
+		AuthKey: ecKey,
+		KeyID:   keyID,
+		TeamID:  teamID,
 	}
 
 	client := apns2.NewTokenClient(t)
