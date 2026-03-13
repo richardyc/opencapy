@@ -18,11 +18,10 @@ type APNsConfig struct {
 
 // Config holds daemon configuration.
 type Config struct {
-	Port            int        `json:"port"`              // default 7242
-	PollInterval    int        `json:"poll_interval"`     // ms, default 500
-	LogPath         string     `json:"log_path"`
-	APNs            APNsConfig `json:"apns"`
-	RealClaudePath  string     `json:"real_claude_path"`  // path to the real claude binary, set by `opencapy install`
+	Port         int        `json:"port"`          // default 7242
+	PollInterval int        `json:"poll_interval"` // ms, default 500
+	LogPath      string     `json:"log_path"`
+	APNs         APNsConfig `json:"apns"`
 }
 
 func configPath() string {

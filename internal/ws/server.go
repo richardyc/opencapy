@@ -61,7 +61,8 @@ type InboundMessage struct {
 	// Live Activity
 	Machine string `json:"machine,omitempty"` // machine name from iOS for live activity token
 	// spawn_pty (shim → daemon)
-	Args []string `json:"args,omitempty"` // command + arguments, e.g. ["claude", "--flag"]
+	Args   []string `json:"args,omitempty"`   // command + arguments, e.g. ["claude", "--flag"]
+	Branch string   `json:"branch,omitempty"` // git branch at launch, set by shell function via OPENCAPY_GIT_BRANCH
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -660,8 +661,8 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if rows <= 0 {
 			rows = 24
 		}
-		// Generate a session name from the project directory basename + timestamp.
-		sessionName := filepath.Base(msg.ProjectPath) + "-" + time.Now().Format("0102-150405")
+		// Generate a human-readable session name: basename + branch (if any) + HH:MM.
+		sessionName := directSessionName(msg.ProjectPath, msg.Branch)
 		s.directSessionsMu.Lock()
 		s.directSessions[sessionName] = &directSessionState{
 			shimClientID: client.ID,
@@ -1398,6 +1399,27 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 	s.directSessionsMu.RUnlock()
 
 	return snapshots
+}
+
+// directSessionName builds a human-readable session key from the project path,
+// optional git branch, and current time. Slashes in branch names are replaced
+// with hyphens so the name is safe to use as a map key.
+// Examples:
+//
+//	myrepo-feat-login-fix-1432
+//	myrepo-1432   (no branch)
+func directSessionName(projectPath, branch string) string {
+	base := filepath.Base(projectPath)
+	if base == "" || base == "." {
+		base = "session"
+	}
+	t := time.Now().Format("1504") // HHmm
+	if branch == "" {
+		return base + "-" + t
+	}
+	// Replace path separators and spaces with hyphens.
+	safeBranch := strings.NewReplacer("/", "-", " ", "-").Replace(branch)
+	return base + "-" + safeBranch + "-" + t
 }
 
 // IsDirectSession returns true if the named session was spawned by the claude shim.

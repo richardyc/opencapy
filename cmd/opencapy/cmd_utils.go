@@ -228,7 +228,8 @@ func newInstallCmd() *cobra.Command {
 				return fmt.Errorf("unsupported platform")
 			}
 
-			installClaudeShim(binaryPath)
+			fmt.Println()
+			injectShellIntegration()
 			promptDefaultTerminal()
 			return nil
 		},
@@ -237,44 +238,6 @@ func newInstallCmd() *cobra.Command {
 	return cmd
 }
 
-// installClaudeShim creates ~/.opencapy/bin/claude that proxies through `opencapy shim`.
-// It also saves the real claude binary path to config so the shim can find it on fallback.
-func installClaudeShim(binaryPath string) {
-	home, _ := os.UserHomeDir()
-	shimDir := filepath.Join(home, ".opencapy", "bin")
-	if err := os.MkdirAll(shimDir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not create shim dir: %v\n", err)
-		return
-	}
-
-	// Find real claude before we shadow it.
-	realClaude, err := exec.LookPath("claude")
-	if err != nil {
-		fmt.Println("⚠  claude CLI not found — install it first, then re-run `opencapy install`")
-		fmt.Println("   https://docs.anthropic.com/en/docs/claude-code/getting-started")
-		return
-	}
-
-	// Save real path to config.
-	cfg, _ := config.Load()
-	if cfg != nil && cfg.RealClaudePath != realClaude {
-		cfg.RealClaudePath = realClaude
-		_ = cfg.Save()
-	}
-
-	// Write the shim script — just delegates to `opencapy shim`.
-	shimPath := filepath.Join(shimDir, "claude")
-	shimScript := fmt.Sprintf("#!/bin/sh\nexec %s shim \"$@\"\n", binaryPath)
-	if err := os.WriteFile(shimPath, []byte(shimScript), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not write claude shim: %v\n", err)
-		return
-	}
-
-	fmt.Printf("\n✓ claude shim installed at %s\n\n", shimPath)
-	fmt.Println("Add this to your ~/.zshrc (or ~/.bash_profile):")
-	fmt.Printf("  export PATH=\"$HOME/.opencapy/bin:$PATH\"\n\n")
-	fmt.Println("Then open a new terminal and run `claude` — sessions will appear in the iOS app automatically.")
-}
 
 // editorSettingsPaths returns candidate settings.json paths for known editors.
 func editorSettingsPaths() []string {

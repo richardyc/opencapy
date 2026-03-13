@@ -36,6 +36,7 @@ func main() {
 		newInstallCmd(),
 		newUpdateCmd(),
 		newShimCmd(),
+		newInitCmd(),
 		&cobra.Command{
 			Use:   "version",
 			Short: "Print version info",
