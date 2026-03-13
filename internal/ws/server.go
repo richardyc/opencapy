@@ -105,6 +105,11 @@ type Server struct {
 	// Direct sessions: spawned by the claude shim, not tmux.
 	directSessions   map[string]*directSessionState
 	directSessionsMu sync.RWMutex
+	// Tracks when each direct session last received a pty_resize from iOS.
+	// Structured event detection is suppressed for 1s after a resize to
+	// prevent full-screen terminal redraws from triggering false approvals.
+	directResizeAt   map[string]time.Time
+	directResizeMu   sync.RWMutex
 }
 
 type liveActivityEntry struct {
@@ -143,6 +148,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		liveActivityTokens: make(map[string]liveActivityEntry),
 		clientDeviceNames:  make(map[string]string),
 		directSessions:     make(map[string]*directSessionState),
+		directResizeAt:     make(map[string]time.Time),
 	}
 }
 
@@ -712,7 +718,17 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		}
 		s.directSessionsMu.Unlock()
 		// Event detection (approval/crash/done) for push notifications.
-		s.sessionWatch.Feed(msg.Session, string(decoded))
+		// Skip structured detection for 1s after a resize — terminal redraws
+		// send the full screen content which can match approval patterns and
+		// trigger false Live Activity alerts. Still emit EventOutput for UI.
+		s.directResizeMu.RLock()
+		sinceResize := time.Since(s.directResizeAt[msg.Session])
+		s.directResizeMu.RUnlock()
+		if sinceResize > time.Second {
+			s.sessionWatch.Feed(msg.Session, string(decoded))
+		} else {
+			s.sessionWatch.FeedOutput(msg.Session, string(decoded))
+		}
 		// Forward to iOS subscribers as pty_output.
 		if len(subscribers) > 0 {
 			outMsg, _ := json.Marshal(OutboundMessage{
@@ -855,8 +871,12 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if cols <= 0 || rows <= 0 {
 			break
 		}
-		// Direct session: forward resize to shim (shim calls pty.Setsize).
+		// Direct session: forward resize to shim and record timestamp to
+		// suppress false approval detection during the subsequent redraw.
 		if s.IsDirectSession(msg.Session) {
+			s.directResizeMu.Lock()
+			s.directResizeAt[msg.Session] = time.Now()
+			s.directResizeMu.Unlock()
 			s.forwardToShim(msg.Session, "pty_resize", map[string]int{
 				"cols": cols,
 				"rows": rows,

@@ -188,6 +188,25 @@ func (w *Watcher) poll() {
 	}
 }
 
+// FeedOutput emits only an EventOutput for a direct session, skipping structured
+// event detection. Used during the resize window to keep the UI updated without
+// risking false approval/crash/done events from terminal redraw content.
+func (w *Watcher) FeedOutput(sessionName, output string) {
+	if output == "" {
+		return
+	}
+	lines := strings.Split(output, "\n")
+	if len(lines) > 15 {
+		lines = lines[len(lines)-15:]
+	}
+	w.tryEmit(sessionName, Event{
+		Type:      EventOutput,
+		Session:   sessionName,
+		Content:   strings.Join(lines, "\n"),
+		Timestamp: time.Now(),
+	}, 1*time.Second)
+}
+
 // Feed processes a chunk of raw PTY output for a direct (non-tmux) session.
 // It runs the same event detection and cooldown logic as the poll loop,
 // but is driven by streaming bytes instead of tmux capture-pane polling.
