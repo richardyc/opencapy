@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -218,11 +221,74 @@ func newInstallCmd() *cobra.Command {
 			fmt.Println()
 			fmt.Println("Done! Open a new terminal, then run: claude")
 			fmt.Println("To pair your iPhone:  opencapy qr")
-			fmt.Println()
-			fmt.Println("VS Code/Cursor: add to settings.json for accurate tab titles:")
-			fmt.Println(`  "terminal.integrated.tabs.title": "${sequence}"`)
+			patchVSCodeTabTitle()
 			return nil
 		},
+	}
+}
+
+// patchVSCodeTabTitle adds terminal.integrated.tabs.title = "${sequence}" to
+// VS Code / Cursor settings.json if either editor is detected. Skips silently
+// if no editor is found or the file can't be parsed (e.g. JSONC with comments).
+func patchVSCodeTabTitle() {
+	home, _ := os.UserHomeDir()
+	var candidates []string
+	if runtime.GOOS == "darwin" {
+		base := filepath.Join(home, "Library", "Application Support")
+		candidates = []string{
+			filepath.Join(base, "Code", "User", "settings.json"),
+			filepath.Join(base, "Cursor", "User", "settings.json"),
+			filepath.Join(base, "VSCodium", "User", "settings.json"),
+		}
+	} else {
+		base := filepath.Join(home, ".config")
+		candidates = []string{
+			filepath.Join(base, "Code", "User", "settings.json"),
+			filepath.Join(base, "Cursor", "User", "settings.json"),
+			filepath.Join(base, "VSCodium", "User", "settings.json"),
+		}
+	}
+
+	const key = "terminal.integrated.tabs.title"
+	const val = "${sequence}"
+	patched := false
+
+	for _, path := range candidates {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // editor not installed
+		}
+		var settings map[string]interface{}
+		if err := json.Unmarshal(data, &settings); err != nil {
+			// JSONC with comments — can't safely patch; print manual tip instead
+			fmt.Printf("\n  %s detected — add to settings.json manually:\n", filepath.Base(filepath.Dir(filepath.Dir(path))))
+			fmt.Printf(`    "%s": "%s"`+"\n", key, val)
+			patched = true
+			continue
+		}
+		if v, ok := settings[key]; ok && v == val {
+			fmt.Printf("✓ %s tab titles already configured\n", filepath.Base(filepath.Dir(filepath.Dir(path))))
+			patched = true
+			continue
+		}
+		settings[key] = val
+		out, err := json.MarshalIndent(settings, "", "    ")
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", path, err)
+			continue
+		}
+		fmt.Printf("✓ %s tab titles configured for accurate session names\n", filepath.Base(filepath.Dir(filepath.Dir(path))))
+		patched = true
+	}
+
+	if !patched {
+		// No editor detected — print the tip for future reference
+		fmt.Println()
+		fmt.Println("VS Code/Cursor: add to settings.json for accurate tab titles:")
+		fmt.Printf(`  "%s": "%s"`+"\n", key, val)
 	}
 }
 
