@@ -60,6 +60,8 @@ type InboundMessage struct {
 	Lines int `json:"lines,omitempty"` // lines of scrollback to capture
 	// Live Activity
 	Machine string `json:"machine,omitempty"` // machine name from iOS for live activity token
+	// spawn_pty (shim → daemon)
+	Args []string `json:"args,omitempty"` // command + arguments, e.g. ["claude", "--flag"]
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -99,12 +101,26 @@ type Server struct {
 	// Populated when iOS registers a Live Activity (which includes the machine name).
 	clientDeviceNames   map[string]string
 	clientDeviceNamesMu sync.RWMutex
+	// Direct sessions: spawned by the claude shim, not tmux.
+	directSessions   map[string]*directSessionState
+	directSessionsMu sync.RWMutex
 }
 
 type liveActivityEntry struct {
 	token       string
 	machineName string
 }
+
+// directSessionState tracks a session spawned by the claude shim (no tmux involved).
+type directSessionState struct {
+	shimClientID string    // WS client ID of the shim that owns this session
+	cwd          string
+	createdAt    time.Time
+	buf          []byte    // ring buffer of raw PTY output (last ~32 KB)
+	subscribers  []string  // iOS client IDs subscribed via open_pty
+}
+
+const directBufMax = 32 * 1024 // 32 KB ring buffer per direct session
 
 // New creates a new WebSocket server.
 func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
@@ -125,6 +141,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		recentEvents:       make(map[string][]watcher.Event),
 		liveActivityTokens: make(map[string]liveActivityEntry),
 		clientDeviceNames:  make(map[string]string),
+		directSessions:     make(map[string]*directSessionState),
 	}
 }
 
@@ -409,10 +426,37 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			s.ptyMgr.CloseByClient(clientID)
 		}
 
+		// Deregister any direct sessions owned by this shim client.
+		s.directSessionsMu.Lock()
+		for name, ds := range s.directSessions {
+			if ds.shimClientID == clientID {
+				delete(s.directSessions, name)
+				if s.registry != nil {
+					_ = s.registry.Unregister(name)
+					_ = s.registry.Save()
+				}
+			}
+		}
+		s.directSessionsMu.Unlock()
+
+		// Remove this client from any direct session subscriber lists.
+		s.directSessionsMu.Lock()
+		for _, ds := range s.directSessions {
+			filtered := ds.subscribers[:0]
+			for _, id := range ds.subscribers {
+				if id != clientID {
+					filtered = append(filtered, id)
+				}
+			}
+			ds.subscribers = filtered
+		}
+		s.directSessionsMu.Unlock()
+
 		close(client.send)
 		conn.CloseNow()
 		log.Printf("Client disconnected: %s", clientID)
 		go s.refreshTmuxStatus()
+		go s.BroadcastSnapshot()
 	}()
 
 	for {
@@ -604,17 +648,11 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	// ── PTY messages ──────────────────────────────────────────────────────────
 
-	case "close_pty":
-		if s.ptyMgr != nil && msg.Session != "" {
-			s.ptyMgr.Close(msg.Session)
-		}
-
-	case "open_pty":
-		if s.ptyMgr == nil || msg.Session == "" {
+	case "spawn_pty":
+		// Called by the claude shim to create a new direct (non-tmux) session.
+		if s.ptyMgr == nil || len(msg.Args) == 0 || msg.ProjectPath == "" {
 			break
 		}
-		// Close any stale PTY for this session before reopening (handles reconnect/reopen)
-		s.ptyMgr.Close(msg.Session)
 		cols, rows := msg.Cols, msg.Rows
 		if cols <= 0 {
 			cols = 80
@@ -622,7 +660,101 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if rows <= 0 {
 			rows = 24
 		}
-		// Pass the session's project path so the grouped session starts there.
+		// Generate a session name from the project directory basename + timestamp.
+		sessionName := filepath.Base(msg.ProjectPath) + "-" + time.Now().Format("0102-150405")
+		s.directSessionsMu.Lock()
+		s.directSessions[sessionName] = &directSessionState{
+			shimClientID: client.ID,
+			cwd:          msg.ProjectPath,
+			createdAt:    time.Now(),
+		}
+		s.directSessionsMu.Unlock()
+		if s.registry != nil {
+			_ = s.registry.Register(sessionName, msg.ProjectPath)
+			_ = s.registry.Save()
+		}
+		if err := s.ptyMgr.OpenDirect(sessionName, client.ID, cols, rows, msg.ProjectPath, msg.Args); err != nil {
+			log.Printf("spawn_pty %q: %v", sessionName, err)
+			s.directSessionsMu.Lock()
+			delete(s.directSessions, sessionName)
+			s.directSessionsMu.Unlock()
+			break
+		}
+		// Acknowledge with the assigned session name so the shim can display it.
+		ack, _ := json.Marshal(OutboundMessage{
+			Type:    "session_assigned",
+			Payload: map[string]string{"name": sessionName},
+		})
+		select {
+		case client.send <- ack:
+		default:
+		}
+		go s.BroadcastSnapshot()
+
+	case "close_pty":
+		if msg.Session == "" {
+			break
+		}
+		// For direct sessions iOS sends close_pty to unsubscribe, not to kill the process.
+		if s.IsDirectSession(msg.Session) {
+			s.directSessionsMu.Lock()
+			if ds, ok := s.directSessions[msg.Session]; ok {
+				filtered := ds.subscribers[:0]
+				for _, id := range ds.subscribers {
+					if id != client.ID {
+						filtered = append(filtered, id)
+					}
+				}
+				ds.subscribers = filtered
+			}
+			s.directSessionsMu.Unlock()
+			break
+		}
+		if s.ptyMgr != nil {
+			s.ptyMgr.Close(msg.Session)
+		}
+
+	case "open_pty":
+		if msg.Session == "" {
+			break
+		}
+		cols, rows := msg.Cols, msg.Rows
+		if cols <= 0 {
+			cols = 80
+		}
+		if rows <= 0 {
+			rows = 24
+		}
+		// Direct session: subscribe iOS client to the existing PTY stream + replay history.
+		if s.IsDirectSession(msg.Session) {
+			s.directSessionsMu.Lock()
+			ds, ok := s.directSessions[msg.Session]
+			var history []byte
+			if ok {
+				ds.subscribers = append(ds.subscribers, client.ID)
+				history = make([]byte, len(ds.buf))
+				copy(history, ds.buf)
+			}
+			s.directSessionsMu.Unlock()
+			if !ok {
+				break
+			}
+			// Send ring buffer as pane_content so SwiftTerm populates scrollback.
+			paneMsg, _ := json.Marshal(OutboundMessage{
+				Type:    "pane_content",
+				Payload: map[string]string{"session": msg.Session, "content": string(history)},
+			})
+			select {
+			case client.send <- paneMsg:
+			default:
+			}
+			break
+		}
+		if s.ptyMgr == nil {
+			break
+		}
+		// Tmux session: close any stale PTY and open a new grouped session.
+		s.ptyMgr.Close(msg.Session)
 		startDir := ""
 		if s.registry != nil {
 			if p, ok := s.registry.GetProject(msg.Session); ok {
@@ -739,16 +871,26 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Session == "" {
 			break
 		}
-		lines := msg.Lines
-		if lines <= 0 {
-			lines = 300
-		}
-		// Plain text (no -e) so SwiftTerm accumulates scrollback lines instead
-		// of cursor-positioning escape sequences that prevent scrollback growth.
-		output, err := tmux.CapturePaneOutput(msg.Session, lines, false)
-		if err != nil {
-			log.Printf("capture_pane %q: %v", msg.Session, err)
-			break
+		var output string
+		if s.IsDirectSession(msg.Session) {
+			s.directSessionsMu.RLock()
+			if ds, ok := s.directSessions[msg.Session]; ok {
+				output = string(ds.buf)
+			}
+			s.directSessionsMu.RUnlock()
+		} else {
+			lines := msg.Lines
+			if lines <= 0 {
+				lines = 300
+			}
+			// Plain text (no -e) so SwiftTerm accumulates scrollback lines instead
+			// of cursor-positioning escape sequences that prevent scrollback growth.
+			var err error
+			output, err = tmux.CapturePaneOutput(msg.Session, lines, false)
+			if err != nil {
+				log.Printf("capture_pane %q: %v", msg.Session, err)
+				break
+			}
 		}
 		data, _ := json.Marshal(OutboundMessage{
 			Type:    "pane_content",
@@ -1080,8 +1222,39 @@ func (s *Server) BroadcastSnapshot() {
 	}
 }
 
-// SendPTYOutput sends pty_output only to the client that owns the PTY session.
+// SendPTYOutput sends pty_output to the shim that owns the session, and for direct
+// sessions also forwards to any iOS clients subscribed via open_pty.
+// A nil Data slice signals process exit — the direct session is deregistered.
 func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
+	// nil Data = process exited; deregister direct session and broadcast.
+	if out.Data == nil {
+		if s.IsDirectSession(out.Session) {
+			s.directSessionsMu.Lock()
+			delete(s.directSessions, out.Session)
+			s.directSessionsMu.Unlock()
+			if s.registry != nil {
+				_ = s.registry.Unregister(out.Session)
+				_ = s.registry.Save()
+			}
+			go s.BroadcastSnapshot()
+		}
+		return
+	}
+
+	// Append to ring buffer for direct sessions and collect subscriber list.
+	var subscribers []string
+	if s.IsDirectSession(out.Session) {
+		s.directSessionsMu.Lock()
+		if ds, ok := s.directSessions[out.Session]; ok {
+			ds.buf = append(ds.buf, out.Data...)
+			if len(ds.buf) > directBufMax {
+				ds.buf = ds.buf[len(ds.buf)-directBufMax:]
+			}
+			subscribers = append([]string(nil), ds.subscribers...)
+		}
+		s.directSessionsMu.Unlock()
+	}
+
 	msg := OutboundMessage{
 		Type: "pty_output",
 		Payload: map[string]interface{}{
@@ -1093,15 +1266,30 @@ func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
 	if err != nil {
 		return
 	}
+
+	// Send to shim owner.
 	s.mu.RLock()
-	c, ok := s.clients[out.ClientID]
+	owner, ok := s.clients[out.ClientID]
 	s.mu.RUnlock()
-	if !ok {
-		return
+	if ok {
+		select {
+		case owner.send <- data:
+		default:
+		}
 	}
-	select {
-	case c.send <- data:
-	default:
+
+	// Also forward to iOS subscribers (direct sessions only).
+	if len(subscribers) > 0 {
+		s.mu.RLock()
+		for _, id := range subscribers {
+			if c, ok := s.clients[id]; ok {
+				select {
+				case c.send <- data:
+				default:
+				}
+			}
+		}
+		s.mu.RUnlock()
 	}
 }
 
@@ -1192,7 +1380,32 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 		})
 	}
 
+	// Append direct (non-tmux) sessions spawned by the claude shim.
+	s.directSessionsMu.RLock()
+	for name, ds := range s.directSessions {
+		s.recentMu.RLock()
+		recent := append([]watcher.Event{}, s.recentEvents[name]...)
+		s.recentMu.RUnlock()
+		snapshots = append(snapshots, SessionSnapshot{
+			Name:         name,
+			ProjectPath:  ds.cwd,
+			LastOutput:   string(ds.buf),
+			Created:      ds.createdAt,
+			LastActive:   ds.createdAt,
+			RecentEvents: recent,
+		})
+	}
+	s.directSessionsMu.RUnlock()
+
 	return snapshots
+}
+
+// IsDirectSession returns true if the named session was spawned by the claude shim.
+func (s *Server) IsDirectSession(name string) bool {
+	s.directSessionsMu.RLock()
+	_, ok := s.directSessions[name]
+	s.directSessionsMu.RUnlock()
+	return ok
 }
 
 // BroadcastFileEvent marshals a FileEvent and broadcasts it to all connected clients.

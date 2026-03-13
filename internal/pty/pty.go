@@ -34,7 +34,7 @@ type PTYOutput struct {
 // PTYSession holds a single active PTY session.
 type PTYSession struct {
 	sessionName string
-	groupName   string // grouped tmux session name; cleaned up on close
+	groupName   string // grouped tmux session name; empty for direct sessions
 	ptmx        *os.File
 	cmd         *exec.Cmd
 	clientID    string // who opened this PTY
@@ -178,6 +178,75 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir st
 	return nil
 }
 
+// OpenDirect spawns an arbitrary command inside a PTY without any tmux involvement.
+// Used by the claude shim so the daemon can stream output to iOS without tmux.
+func (m *Manager) OpenDirect(sessionName, clientID string, cols, rows int, cwd string, args []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.sessions[sessionName]; exists {
+		return fmt.Errorf("pty session %q already open", sessionName)
+	}
+
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(),
+		"TERM=xterm-256color",
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
+		"LC_CTYPE=en_US.UTF-8",
+	)
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Cols: uint16(cols),
+		Rows: uint16(rows),
+	})
+	if err != nil {
+		return fmt.Errorf("start direct pty for %q: %w", sessionName, err)
+	}
+
+	sess := &PTYSession{
+		sessionName: sessionName,
+		groupName:   "", // empty = direct session; no tmux cleanup on close
+		ptmx:        ptmx,
+		cmd:         cmd,
+		clientID:    clientID,
+	}
+	m.sessions[sessionName] = sess
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := ptmx.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				select {
+				case m.events <- PTYOutput{Session: sessionName, ClientID: clientID, Data: chunk}:
+				default:
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		_ = sess.cmd.Wait()
+		_ = sess.ptmx.Close()
+		m.mu.Lock()
+		if m.sessions[sessionName] == sess {
+			delete(m.sessions, sessionName)
+		}
+		m.mu.Unlock()
+		// Signal that the process exited by sending a zero-length PTYOutput.
+		// The server uses this to deregister the direct session.
+		select {
+		case m.events <- PTYOutput{Session: sessionName, ClientID: clientID, Data: nil}:
+		default:
+		}
+	}()
+
+	return nil
+}
+
 // Write sends bytes to the PTY stdin of the named session.
 func (m *Manager) Write(sessionName string, data []byte) error {
 	m.mu.Lock()
@@ -217,14 +286,13 @@ func (m *Manager) Close(sessionName string) {
 		return
 	}
 
-	// Closing ptmx causes the read goroutine's Read() to return an error,
-	// which breaks the loop and triggers goroutine-side cleanup.
 	_ = sess.ptmx.Close()
 	if sess.cmd.Process != nil {
 		sess.cmd.Process.Kill()
 	}
-	// Kill the grouped session so it doesn't linger after disconnect.
-	_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
+	if sess.groupName != "" {
+		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
+	}
 }
 
 // CloseByClient closes and removes all PTY sessions owned by the given clientID.
@@ -249,6 +317,8 @@ func (m *Manager) CloseByClient(clientID string) {
 		if sess.cmd.Process != nil {
 			sess.cmd.Process.Kill()
 		}
-		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
+		if sess.groupName != "" {
+			_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
+		}
 	}
 }

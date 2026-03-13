@@ -104,7 +104,9 @@ func newDaemonCmd() *cobra.Command {
 			// Start WebSocket server
 			srv := ws.New(cfg.Port, w, reg, pushReg, ptyMgr)
 
-			// Forward PTY output events to the owning WebSocket client only
+			// Forward PTY output events to the owning WebSocket client.
+			// For direct (non-tmux) sessions also feed output into the watcher
+			// so event detection (approval/crash/done) works without tmux polling.
 			go func() {
 				for {
 					select {
@@ -112,6 +114,9 @@ func newDaemonCmd() *cobra.Command {
 						return
 					case out := <-ptyMgr.Events():
 						srv.SendPTYOutput(out)
+						if out.Data != nil && srv.IsDirectSession(out.Session) {
+							w.Feed(out.Session, string(out.Data))
+						}
 					}
 				}
 			}()
@@ -188,9 +193,13 @@ func newDaemonCmd() *cobra.Command {
 						}
 
 						// Remove sessions that are in the registry but no longer in tmux.
+						// Skip direct sessions — they are managed by the shim, not tmux.
 						if reg != nil {
 							for name := range reg.All() {
 								if _, alive := liveMap[name]; !alive {
+									if srv.IsDirectSession(name) {
+										continue
+									}
 									w.RemoveSession(name)
 									_ = reg.Unregister(name)
 									changed = true

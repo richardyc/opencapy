@@ -35,6 +35,7 @@ func main() {
 		newQRCmd(),
 		newInstallCmd(),
 		newUpdateCmd(),
+		newShimCmd(),
 		&cobra.Command{
 			Use:   "version",
 			Short: "Print version info",

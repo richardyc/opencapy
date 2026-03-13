@@ -193,7 +193,7 @@ func verifyDaemon() error {
 func newInstallCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "install",
-		Short: "Install daemon as system service (LaunchAgent on Mac, systemd on Linux)",
+		Short: "Install daemon as system service and set up the claude shim",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vscode, _ := cmd.Flags().GetBool("vscode")
 			if vscode {
@@ -205,8 +205,9 @@ func newInstallCmd() *cobra.Command {
 				return fmt.Errorf("find binary path: %w", err)
 			}
 
-			if err := ensureTmux(); err != nil {
-				return fmt.Errorf("tmux required: %w", err)
+			// tmux is now optional — the claude shim provides a tmux-free path.
+			if _, err := exec.LookPath("tmux"); err != nil {
+				fmt.Println("ℹ tmux not found — sessions will run via the claude shim (no tmux needed)")
 			}
 
 			if platform.IsMacOS() {
@@ -216,26 +217,63 @@ func newInstallCmd() *cobra.Command {
 				}
 				fmt.Println("LaunchAgent installed and loaded.")
 				fmt.Println("The daemon will start automatically on login.")
-				promptDefaultTerminal()
-				return nil
-			}
-
-			if platform.IsLinux() {
+			} else if platform.IsLinux() {
 				fmt.Println("Installing systemd service...")
 				if err := platform.InstallSystemd(binaryPath); err != nil {
 					return fmt.Errorf("install systemd: %w", err)
 				}
 				fmt.Println("systemd service installed and enabled.")
 				fmt.Println("Start with: sudo systemctl start opencapy")
-				promptDefaultTerminal()
-				return nil
+			} else {
+				return fmt.Errorf("unsupported platform")
 			}
 
-			return fmt.Errorf("unsupported platform")
+			installClaudeShim(binaryPath)
+			promptDefaultTerminal()
+			return nil
 		},
 	}
 	cmd.Flags().Bool("vscode", false, "Configure VSCode/Cursor terminal to use opencapy automatically")
 	return cmd
+}
+
+// installClaudeShim creates ~/.opencapy/bin/claude that proxies through `opencapy shim`.
+// It also saves the real claude binary path to config so the shim can find it on fallback.
+func installClaudeShim(binaryPath string) {
+	home, _ := os.UserHomeDir()
+	shimDir := filepath.Join(home, ".opencapy", "bin")
+	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not create shim dir: %v\n", err)
+		return
+	}
+
+	// Find real claude before we shadow it.
+	realClaude, err := exec.LookPath("claude")
+	if err != nil {
+		fmt.Println("⚠  claude CLI not found — install it first, then re-run `opencapy install`")
+		fmt.Println("   https://docs.anthropic.com/en/docs/claude-code/getting-started")
+		return
+	}
+
+	// Save real path to config.
+	cfg, _ := config.Load()
+	if cfg != nil && cfg.RealClaudePath != realClaude {
+		cfg.RealClaudePath = realClaude
+		_ = cfg.Save()
+	}
+
+	// Write the shim script — just delegates to `opencapy shim`.
+	shimPath := filepath.Join(shimDir, "claude")
+	shimScript := fmt.Sprintf("#!/bin/sh\nexec %s shim \"$@\"\n", binaryPath)
+	if err := os.WriteFile(shimPath, []byte(shimScript), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not write claude shim: %v\n", err)
+		return
+	}
+
+	fmt.Printf("\n✓ claude shim installed at %s\n\n", shimPath)
+	fmt.Println("Add this to your ~/.zshrc (or ~/.bash_profile):")
+	fmt.Printf("  export PATH=\"$HOME/.opencapy/bin:$PATH\"\n\n")
+	fmt.Println("Then open a new terminal and run `claude` — sessions will appear in the iOS app automatically.")
 }
 
 // editorSettingsPaths returns candidate settings.json paths for known editors.
@@ -456,58 +494,6 @@ fi`
 	}
 }
 
-// ensureTmux checks that tmux is available, and installs it if not.
-func ensureTmux() error {
-	if _, err := exec.LookPath("tmux"); err == nil {
-		return nil // already installed
-	}
-
-	fmt.Println("tmux not found — installing...")
-
-	// Detect package manager and build install command.
-	type pm struct {
-		bin  string
-		args []string
-	}
-	var mgr *pm
-	switch {
-	case runtime.GOOS == "darwin":
-		if _, err := exec.LookPath("brew"); err == nil {
-			mgr = &pm{"brew", []string{"install", "tmux"}}
-		}
-	default:
-		for _, candidate := range []pm{
-			{"apt-get", []string{"install", "-y", "tmux"}},
-			{"dnf", []string{"install", "-y", "tmux"}},
-			{"yum", []string{"install", "-y", "tmux"}},
-			{"pacman", []string{"-S", "--noconfirm", "tmux"}},
-			{"zypper", []string{"install", "-y", "tmux"}},
-		} {
-			if _, err := exec.LookPath(candidate.bin); err == nil {
-				mgr = &pm{candidate.bin, candidate.args}
-				break
-			}
-		}
-	}
-
-	if mgr == nil {
-		return fmt.Errorf("could not find a supported package manager — please install tmux manually and re-run")
-	}
-
-	cmd := exec.Command(mgr.bin, mgr.args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("install tmux via %s: %w", mgr.bin, err)
-	}
-
-	// Verify install succeeded.
-	if _, err := exec.LookPath("tmux"); err != nil {
-		return fmt.Errorf("tmux still not found after install — please install manually")
-	}
-	fmt.Println("tmux installed successfully.")
-	return nil
-}
 
 // loginShell returns the login shell for the given username by reading /etc/passwd.
 func loginShell(username string) string {
