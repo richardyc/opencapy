@@ -3,6 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Smart Placement routes each Worker invocation to the nearest Cloudflare PoP
+# (Hong Kong, Singapore, Tokyo, etc. for Asian users) rather than a fixed region.
+[placement]
+mode = "smart"
+
 [[durable_objects.bindings]]
 name = "RELAY"
 class_name = "RelayRoom"
