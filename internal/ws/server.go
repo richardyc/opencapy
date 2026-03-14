@@ -106,6 +106,10 @@ type Server struct {
 	// Direct sessions: spawned by the claude shim, not tmux.
 	directSessions   map[string]*directSessionState
 	directSessionsMu sync.RWMutex
+	// Pending approval channels: session → channel awaiting iOS approve/deny decision.
+	// The PermissionRequest hook handler blocks on this channel until iOS responds.
+	pendingApprovals   map[string]chan bool
+	pendingApprovalsMu sync.Mutex
 }
 
 type liveActivityEntry struct {
@@ -144,6 +148,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		liveActivityTokens: make(map[string]liveActivityEntry),
 		clientDeviceNames:  make(map[string]string),
 		directSessions:     make(map[string]*directSessionState),
+		pendingApprovals:   make(map[string]chan bool),
 	}
 }
 
@@ -507,31 +512,51 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Session == "" {
 			break
 		}
-		if s.IsDirectSession(msg.Session) {
-			// Send "1" + Enter: navigates to option 1 and confirms.
-			s.forwardToShim(msg.Session, "pty_input", map[string]string{
-				"session": msg.Session,
-				"data":    base64.StdEncoding.EncodeToString([]byte("1\r")),
-			})
+		// If PermissionRequest hook is still waiting, resolve it directly — this
+		// is more reliable than sending keystrokes since newer Claude Code may not
+		// show a terminal prompt when a hook handles the permission request.
+		s.pendingApprovalsMu.Lock()
+		ch, hasPending := s.pendingApprovals[msg.Session]
+		s.pendingApprovalsMu.Unlock()
+		if hasPending {
+			select {
+			case ch <- true:
+			default:
+			}
 		} else {
-			_ = tmux.SendKeyNoEnter(msg.Session, "1")
-			_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
+			// Fallback: no pending hook channel, send Enter to the terminal.
+			if s.IsDirectSession(msg.Session) {
+				s.forwardToShim(msg.Session, "pty_input", map[string]string{
+					"session": msg.Session,
+					"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
+				})
+			} else {
+				_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
+			}
 		}
 
 	case "deny":
 		if msg.Session == "" {
 			break
 		}
-		if s.IsDirectSession(msg.Session) {
-			// Down×3 moves past all options to the last one, Enter confirms.
-			// \x1b[B is the Down arrow escape sequence in raw terminal mode.
-			deny := "\x1b[B\x1b[B\x1b[B\r"
-			s.forwardToShim(msg.Session, "pty_input", map[string]string{
-				"session": msg.Session,
-				"data":    base64.StdEncoding.EncodeToString([]byte(deny)),
-			})
+		s.pendingApprovalsMu.Lock()
+		ch, hasPending := s.pendingApprovals[msg.Session]
+		s.pendingApprovalsMu.Unlock()
+		if hasPending {
+			select {
+			case ch <- false:
+			default:
+			}
 		} else {
-			_ = tmux.SendRawKeys(msg.Session, []string{"Down", "Down", "Down", "Enter"})
+			if s.IsDirectSession(msg.Session) {
+				deny := "\x1b[B\r"
+				s.forwardToShim(msg.Session, "pty_input", map[string]string{
+					"session": msg.Session,
+					"data":    base64.StdEncoding.EncodeToString([]byte(deny)),
+				})
+			} else {
+				_ = tmux.SendRawKeys(msg.Session, []string{"Down", "Enter"})
+			}
 		}
 
 	case "send_keys":
@@ -1578,8 +1603,10 @@ func (s *Server) bindSessionByCwd(cwd string) string {
 // Hooks are configured by opencapy install in ~/.claude/settings.json.
 // Always returns 200 so claude is never blocked if the daemon is slow.
 func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
+	// Do NOT write the status header here — PermissionRequest needs to block and
+	// write a JSON body before committing the response.
 	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	var payload map[string]interface{}
@@ -1600,12 +1627,14 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			s.directSessionsMu.Unlock()
 			log.Printf("[hook] SessionStart: bound %q → cwd=%q", name, cwd)
 		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	sessionName := s.findDirectSessionByCwd(cwd)
 	if sessionName == "" {
 		log.Printf("[hook] %s: no session for cwd=%q", hookName, cwd)
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
@@ -1620,8 +1649,33 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			Content:   content,
 			Timestamp: time.Now(),
 		})
+		// Block until iOS approves/denies or 30s timeout.
+		// Return a JSON decision body so Claude Code handles it directly
+		// rather than falling back to an interactive terminal prompt.
+		ch := make(chan bool, 1)
+		s.pendingApprovalsMu.Lock()
+		s.pendingApprovals[sessionName] = ch
+		s.pendingApprovalsMu.Unlock()
+		defer func() {
+			s.pendingApprovalsMu.Lock()
+			delete(s.pendingApprovals, sessionName)
+			s.pendingApprovalsMu.Unlock()
+		}()
+		w.Header().Set("Content-Type", "application/json")
+		select {
+		case approved := <-ch:
+			if approved {
+				w.Write([]byte(`{"permissionDecision":"allow"}`))
+			} else {
+				w.Write([]byte(`{"permissionDecision":"deny"}`))
+			}
+		case <-time.After(30 * time.Second):
+			// Timeout — return empty body, Claude falls back to its default.
+			w.WriteHeader(http.StatusOK)
+		}
 	case "Stop":
 		if active, _ := payload["stop_hook_active"].(bool); active {
+			w.WriteHeader(http.StatusOK)
 			return // already in a stop hook loop, skip
 		}
 		lastMsg, _ := payload["last_assistant_message"].(string)
@@ -1631,22 +1685,23 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			Content:   lastMsg,
 			Timestamp: time.Now(),
 		})
+		w.WriteHeader(http.StatusOK)
 	case "PreToolUse":
-		// Claude finished thinking and is about to execute a tool.
-		// Emit running immediately so the Live Activity shows active status
-		// during the thinking phase before PostToolUse fires.
 		s.sessionWatch.Emit(watcher.Event{
 			Type:      watcher.EventRunning,
 			Session:   sessionName,
 			Timestamp: time.Now(),
 		})
+		w.WriteHeader(http.StatusOK)
 	case "PostToolUse":
-		// Tool completed — keep Live Activity in running state for next tool/thinking.
 		s.sessionWatch.Emit(watcher.Event{
 			Type:      watcher.EventRunning,
 			Session:   sessionName,
 			Timestamp: time.Now(),
 		})
+		w.WriteHeader(http.StatusOK)
+	default:
+		w.WriteHeader(http.StatusOK)
 	}
 }
 
