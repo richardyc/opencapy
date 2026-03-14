@@ -1631,6 +1631,14 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			Content:   lastMsg,
 			Timestamp: time.Now(),
 		})
+	case "PostToolUse":
+		// Claude is actively using tools — reset title to running in case it
+		// was showing ✓ done or ✗ crashed from a previous task.
+		s.sessionWatch.Emit(watcher.Event{
+			Type:      watcher.EventRunning,
+			Session:   sessionName,
+			Timestamp: time.Now(),
+		})
 	}
 }
 

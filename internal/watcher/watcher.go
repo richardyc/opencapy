@@ -18,7 +18,8 @@ const (
 	EventApproval EventType = "approval"
 	EventCrash    EventType = "crash"
 	EventDone     EventType = "done"
-	EventOutput   EventType = "output" // raw pane lines for live display
+	EventRunning  EventType = "running" // new task started after a done/crash
+	EventOutput   EventType = "output"  // raw pane lines for live display
 )
 
 // Event represents a detected CC event in a tmux pane.

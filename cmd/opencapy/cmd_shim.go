@@ -283,6 +283,8 @@ func updateTitleFromEvent(sessionName string, payloadRaw json.RawMessage) {
 		return
 	}
 	switch payload.Type {
+	case "running":
+		setTerminalTitle(fmt.Sprintf("claude · %s · running", sessionName))
 	case "approval":
 		setTerminalTitle(fmt.Sprintf("🔴 claude · %s · needs OK", sessionName))
 	case "done":
