@@ -657,11 +657,18 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		// Brief pause so the NSPasteboard change fully propagates before
 		// Claude Code's clipboard read is triggered.
 		time.Sleep(300 * time.Millisecond)
-		// Send Ctrl+V directly to the tmux session — no PTY required.
-		// Use the raw byte (\x16) rather than the key name so tmux
-		// doesn't interpret it differently across versions.
+		// Send Ctrl+V (0x16) to the session so Claude Code reads the clipboard.
 		if msg.Session != "" {
-			_ = tmux.SendKeyNoEnter(msg.Session, "\x16")
+			if s.IsDirectSession(msg.Session) {
+				// Direct session: forward Ctrl+V through the shim's PTY.
+				s.forwardToShim(msg.Session, "pty_input", map[string]string{
+					"session": msg.Session,
+					"data":    base64.StdEncoding.EncodeToString([]byte{0x16}),
+				})
+			} else {
+				// tmux session: send via tmux send-keys.
+				_ = tmux.SendKeyNoEnter(msg.Session, "\x16")
+			}
 		}
 		sendImageAck("")
 
