@@ -139,12 +139,18 @@ func newShimCmd() *cobra.Command {
 						break
 					}
 				}
-				// Notify daemon the session has ended, then cancel the context.
+				// Notify daemon the session has ended with exit code for crash detection.
+				exitCode := 0
+				if err := claudeCmd.Wait(); err != nil {
+					if ee, ok := err.(*exec.ExitError); ok {
+						exitCode = ee.ExitCode()
+					}
+				}
 				_ = wsjson.Write(ctx, conn, map[string]interface{}{
-					"type":    "session_end",
-					"session": sessionName,
+					"type":      "session_end",
+					"session":   sessionName,
+					"exit_code": exitCode,
 				})
-				claudeCmd.Wait() //nolint:errcheck
 				cancel()
 			}()
 
@@ -204,6 +210,10 @@ func newShimCmd() *cobra.Command {
 			}
 
 			setTerminalTitle("")
+			// WS disconnected (daemon restarted or stopped) but claude is still
+			// running. Wait for claude to exit naturally instead of killing it.
+			// The ctx will be cancelled by the PTY goroutine when claude exits.
+			<-ctx.Done()
 			return nil
 		},
 	}

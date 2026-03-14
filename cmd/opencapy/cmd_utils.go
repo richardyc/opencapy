@@ -217,6 +217,7 @@ func newInstallCmd() *cobra.Command {
 			}
 
 			injectShellIntegration()
+			injectClaudeHooks()
 
 			fmt.Println()
 			fmt.Println("Done! Open a new terminal, then run: claude")
@@ -322,8 +323,9 @@ func newUninstallCmd() *cobra.Command {
 			killAndWait(port)
 			fmt.Println("✓ Daemon stopped")
 
-			// Remove shell integration.
+			// Remove shell integration and Claude Code hooks.
 			removeShellIntegration(home)
+			removeClaudeHooks()
 
 			fmt.Println()
 			fmt.Println("opencapy uninstalled. Your claude installation is unchanged.")

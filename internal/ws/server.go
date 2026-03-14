@@ -61,7 +61,8 @@ type InboundMessage struct {
 	// Live Activity
 	Machine string `json:"machine,omitempty"` // machine name from iOS for live activity token
 	// register_session (shim → daemon): shim owns the PTY, daemon just routes
-	Branch string `json:"branch,omitempty"` // git branch at launch, set by shell function via OPENCAPY_GIT_BRANCH
+	Branch   string `json:"branch,omitempty"`    // git branch at launch
+	ExitCode int    `json:"exit_code,omitempty"` // process exit code, sent in session_end
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -105,11 +106,6 @@ type Server struct {
 	// Direct sessions: spawned by the claude shim, not tmux.
 	directSessions   map[string]*directSessionState
 	directSessionsMu sync.RWMutex
-	// Tracks when each direct session last received a pty_resize from iOS.
-	// Structured event detection is suppressed for 1s after a resize to
-	// prevent full-screen terminal redraws from triggering false approvals.
-	directResizeAt   map[string]time.Time
-	directResizeMu   sync.RWMutex
 }
 
 type liveActivityEntry struct {
@@ -148,7 +144,6 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		liveActivityTokens: make(map[string]liveActivityEntry),
 		clientDeviceNames:  make(map[string]string),
 		directSessions:     make(map[string]*directSessionState),
-		directResizeAt:     make(map[string]time.Time),
 	}
 }
 
@@ -168,6 +163,7 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 	mux.HandleFunc("/qr", s.handleQR)
 	mux.HandleFunc("/pair", s.handlePair)
+	mux.HandleFunc("/hooks/claude", s.handleClaudeHook)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.port),
@@ -684,14 +680,6 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			createdAt:    time.Now(),
 		}
 		s.directSessionsMu.Unlock()
-		// Suppress structured event detection for 2s on first connect.
-		// The initial pty_data stream replays the full terminal scrollback from
-		// top to bottom — historical content (e.g. a previously-resolved trust
-		// folder prompt buried in history) would trigger false approvals without
-		// this guard. Same mechanism as the pty_resize suppression.
-		s.directResizeMu.Lock()
-		s.directResizeAt[sessionName] = time.Now().Add(time.Second) // 2s total window
-		s.directResizeMu.Unlock()
 		if s.registry != nil {
 			_ = s.registry.Register(sessionName, msg.ProjectPath)
 			_ = s.registry.Save()
@@ -725,18 +713,9 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			subscribers = append([]string(nil), ds.subscribers...)
 		}
 		s.directSessionsMu.Unlock()
-		// Event detection (approval/crash/done) for push notifications.
-		// Skip structured detection for 1s after a resize — terminal redraws
-		// send the full screen content which can match approval patterns and
-		// trigger false Live Activity alerts. Still emit EventOutput for UI.
-		s.directResizeMu.RLock()
-		sinceResize := time.Since(s.directResizeAt[msg.Session])
-		s.directResizeMu.RUnlock()
-		if sinceResize > time.Second {
-			s.sessionWatch.Feed(msg.Session, string(decoded))
-		} else {
-			s.sessionWatch.FeedOutput(msg.Session, string(decoded))
-		}
+		// Emit EventOutput for live pane display. Approval/done/crash detection
+		// is handled by Claude Code hooks via the /hooks/claude endpoint.
+		s.sessionWatch.FeedOutput(msg.Session, string(decoded))
 		// Forward to iOS subscribers as pty_output.
 		if len(subscribers) > 0 {
 			outMsg, _ := json.Marshal(OutboundMessage{
@@ -762,6 +741,14 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		// Shim signals claude has exited.
 		if msg.Session == "" {
 			break
+		}
+		if msg.ExitCode != 0 {
+			s.sessionWatch.Emit(watcher.Event{
+				Type:      watcher.EventCrash,
+				Session:   msg.Session,
+				Content:   fmt.Sprintf("Process exited with code %d", msg.ExitCode),
+				Timestamp: time.Now(),
+			})
 		}
 		s.directSessionsMu.Lock()
 		delete(s.directSessions, msg.Session)
@@ -879,12 +866,8 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if cols <= 0 || rows <= 0 {
 			break
 		}
-		// Direct session: forward resize to shim and record timestamp to
-		// suppress false approval detection during the subsequent redraw.
+		// Direct session: forward resize to shim.
 		if s.IsDirectSession(msg.Session) {
-			s.directResizeMu.Lock()
-			s.directResizeAt[msg.Session] = time.Now()
-			s.directResizeMu.Unlock()
 			s.forwardToShim(msg.Session, "pty_resize", map[string]int{
 				"cols": cols,
 				"rows": rows,
@@ -1522,6 +1505,71 @@ func (s *Server) IsDirectSession(name string) bool {
 	_, ok := s.directSessions[name]
 	s.directSessionsMu.RUnlock()
 	return ok
+}
+
+// findDirectSessionByCwd returns the most recently created direct session for
+// the given working directory. Used to correlate Claude Code hook events.
+func (s *Server) findDirectSessionByCwd(cwd string) string {
+	s.directSessionsMu.RLock()
+	defer s.directSessionsMu.RUnlock()
+	var best string
+	var bestTime time.Time
+	for name, ds := range s.directSessions {
+		if ds.cwd == cwd && ds.createdAt.After(bestTime) {
+			best = name
+			bestTime = ds.createdAt
+		}
+	}
+	return best
+}
+
+// handleClaudeHook receives structured events from Claude Code's hook system
+// and emits them to iOS clients. This replaces the fragile PTY string-matching
+// approach for approval, done, and crash detection on direct sessions.
+//
+// Hooks are configured by opencapy install in ~/.claude/settings.json.
+// Always returns 200 so claude is never blocked if the daemon is slow.
+func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodPost {
+		return
+	}
+	var payload map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		return
+	}
+	hookName, _ := payload["hook_event_name"].(string)
+	cwd, _ := payload["cwd"].(string)
+
+	sessionName := s.findDirectSessionByCwd(cwd)
+	if sessionName == "" {
+		return // no matching session
+	}
+
+	switch hookName {
+	case "PermissionRequest":
+		toolName, _ := payload["tool_name"].(string)
+		toolInputBytes, _ := json.Marshal(payload["tool_input"])
+		content := fmt.Sprintf("Permission needed: %s\n%s", toolName, string(toolInputBytes))
+		s.sessionWatch.Emit(watcher.Event{
+			Type:      watcher.EventApproval,
+			Session:   sessionName,
+			Content:   content,
+			Timestamp: time.Now(),
+		})
+	case "Stop":
+		if active, _ := payload["stop_hook_active"].(bool); active {
+			return // already in a stop hook continuation, skip to avoid loops
+		}
+		lastMsg, _ := payload["last_assistant_message"].(string)
+		s.sessionWatch.Emit(watcher.Event{
+			Type:      watcher.EventDone,
+			Session:   sessionName,
+			Content:   lastMsg,
+			Timestamp: time.Now(),
+		})
+	}
+
 }
 
 // BroadcastFileEvent marshals a FileEvent and broadcasts it to all connected clients.

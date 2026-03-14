@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -134,6 +135,156 @@ func injectFish(home string) {
 		return
 	}
 	fmt.Printf("✓ fish function written to %s\n", funcPath)
+}
+
+// ── Claude Code hooks ──────────────────────────────────────────────────────
+
+const claudeHooksURL = "http://localhost:7242/hooks/claude"
+const claudeHookCmd = "curl -sf -X POST " + claudeHooksURL + " -H 'Content-Type: application/json' -d @- || true"
+
+// injectClaudeHooks merges opencapy's hooks into ~/.claude/settings.json.
+// Uses curl + async:true so claude is never blocked if the daemon is slow.
+// Idempotent — skips if the URL is already present.
+func injectClaudeHooks() {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".claude", "settings.json")
+
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return
+	}
+
+	// Skip if already configured.
+	if strings.Contains(string(data), claudeHooksURL) {
+		fmt.Println("✓ Claude Code hooks already configured")
+		return
+	}
+
+	var settings map[string]interface{}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			// JSONC or unparseable — print manual instructions.
+			fmt.Println("\n  Claude Code hooks — add manually to ~/.claude/settings.json:")
+			printHooksSnippet()
+			return
+		}
+	} else {
+		settings = make(map[string]interface{})
+	}
+
+	hook := map[string]interface{}{
+		"hooks": []interface{}{
+			map[string]interface{}{
+				"type":    "command",
+				"command": claudeHookCmd,
+				"async":   true,
+			},
+		},
+	}
+
+	hooks, _ := settings["hooks"].(map[string]interface{})
+	if hooks == nil {
+		hooks = make(map[string]interface{})
+	}
+	for _, event := range []string{"PermissionRequest", "Stop", "PostToolUse"} {
+		existing, _ := hooks[event].([]interface{})
+		hooks[event] = append(existing, hook)
+	}
+	settings["hooks"] = hooks
+
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	if err := os.WriteFile(path, append(out, '\n'), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", path, err)
+		return
+	}
+	fmt.Println("✓ Claude Code hooks configured (~/.claude/settings.json)")
+}
+
+// removeClaudeHooks removes opencapy's hooks from ~/.claude/settings.json.
+func removeClaudeHooks() {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".claude", "settings.json")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if !strings.Contains(string(data), claudeHooksURL) {
+		return // not present
+	}
+
+	var settings map[string]interface{}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return // JSONC, skip
+	}
+
+	hooks, _ := settings["hooks"].(map[string]interface{})
+	if hooks == nil {
+		return
+	}
+
+	modified := false
+	for event, val := range hooks {
+		groups, _ := val.([]interface{})
+		var filtered []interface{}
+		for _, g := range groups {
+			group, _ := g.(map[string]interface{})
+			inner, _ := group["hooks"].([]interface{})
+			var kept []interface{}
+			for _, h := range inner {
+				hm, _ := h.(map[string]interface{})
+				if cmd, _ := hm["command"].(string); !strings.Contains(cmd, claudeHooksURL) {
+					kept = append(kept, h)
+				} else {
+					modified = true
+				}
+			}
+			if len(kept) > 0 {
+				group["hooks"] = kept
+				filtered = append(filtered, group)
+			} else if len(kept) == 0 && len(inner) > 0 {
+				modified = true // entire group removed
+			}
+		}
+		if len(filtered) > 0 {
+			hooks[event] = filtered
+		} else {
+			delete(hooks, event)
+		}
+	}
+	if len(hooks) == 0 {
+		delete(settings, "hooks")
+	} else {
+		settings["hooks"] = hooks
+	}
+
+	if !modified {
+		return
+	}
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, append(out, '\n'), 0o644)
+	fmt.Println("✓ Claude Code hooks removed from ~/.claude/settings.json")
+}
+
+func printHooksSnippet() {
+	fmt.Printf(`
+  {
+    "hooks": {
+      "PermissionRequest": [{"hooks": [{"type": "command", "command": "%s", "async": true}]}],
+      "Stop":              [{"hooks": [{"type": "command", "command": "%s", "async": true}]}],
+      "PostToolUse":       [{"hooks": [{"type": "command", "command": "%s", "async": true}]}]
+    }
+  }
+`, claudeHookCmd, claudeHookCmd, claudeHookCmd)
 }
 
 // alreadyInjected returns true if the sentinel block is already in the file.

@@ -188,9 +188,18 @@ func (w *Watcher) poll() {
 	}
 }
 
-// FeedOutput emits only an EventOutput for a direct session, skipping structured
-// event detection. Used during the resize window to keep the UI updated without
-// risking false approval/crash/done events from terminal redraw content.
+// Emit sends an event directly to the broadcast channel, bypassing cooldown.
+// Used by the hooks endpoint to emit precise semantic events (approval, done, crash)
+// that come from Claude Code's hook system rather than string matching.
+func (w *Watcher) Emit(ev Event) {
+	select {
+	case w.events <- ev:
+	default:
+	}
+}
+
+// FeedOutput emits only an EventOutput for a direct session.
+// Detection (approval/crash/done) is handled by the hooks endpoint.
 func (w *Watcher) FeedOutput(sessionName, output string) {
 	if output == "" {
 		return
@@ -205,30 +214,6 @@ func (w *Watcher) FeedOutput(sessionName, output string) {
 		Content:   strings.Join(lines, "\n"),
 		Timestamp: time.Now(),
 	}, 1*time.Second)
-}
-
-// Feed processes a chunk of raw PTY output for a direct (non-tmux) session.
-// It runs the same event detection and cooldown logic as the poll loop,
-// but is driven by streaming bytes instead of tmux capture-pane polling.
-func (w *Watcher) Feed(sessionName, output string) {
-	if output == "" {
-		return
-	}
-	lines := strings.Split(output, "\n")
-	if len(lines) > 15 {
-		lines = lines[len(lines)-15:]
-	}
-	w.tryEmit(sessionName, Event{
-		Type:      EventOutput,
-		Session:   sessionName,
-		Content:   strings.Join(lines, "\n"),
-		Timestamp: time.Now(),
-	}, 1*time.Second)
-
-	tail := strings.Join(lines[max(0, len(lines)-5):], "\n")
-	for _, ev := range DetectEvents(sessionName, tail) {
-		w.tryEmit(sessionName, ev, 2*time.Second)
-	}
 }
 
 // tryEmit fires ev if the per-(session,type) cooldown has elapsed.
