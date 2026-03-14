@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/creack/pty"
@@ -114,7 +115,7 @@ func (m *Manager) Open(sessionName, clientID string, cols, rows int, startDir st
 	// Ensure UTF-8 locale so tmux treats this PTY client as a Unicode terminal.
 	// Without LANG/LC_CTYPE the LaunchAgent environment has no locale set, which
 	// makes tmux fall back to ASCII mode and substitute _ for multi-byte characters.
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(safeEnv(),
 		"TERM=xterm-256color",
 		"LANG=en_US.UTF-8",
 		"LC_ALL=en_US.UTF-8",
@@ -248,4 +249,49 @@ func (m *Manager) CloseByClient(clientID string) {
 		}
 		_ = exec.Command(tmuxBin(), "kill-session", "-t", sess.groupName).Run()
 	}
+}
+
+// safeEnv builds a PTY environment from an allowlist of the process env vars.
+// Using an allowlist (not a denylist) prevents daemon secrets — API keys,
+// DATABASE_URL, etc. — from leaking into Claude Code child processes.
+// The caller appends TERM/LANG overrides on top.
+func safeEnv() []string {
+	// Exact keys to pass through.
+	allowed := map[string]bool{
+		"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+		"SSH_AUTH_SOCK": true, "SSH_AGENT_PID": true,
+		"TMPDIR": true, "TMP": true, "TEMP": true,
+		"EDITOR": true, "VISUAL": true, "PAGER": true,
+		"COLORTERM": true, "TERM_PROGRAM": true, "TERM_PROGRAM_VERSION": true,
+		// macOS TLS cert bundle — needed by Go binaries (e.g. gh) that can't
+		// access the Keychain when spawned from a LaunchAgent.
+		"SSL_CERT_FILE": true,
+	}
+	// Key prefixes to pass through.
+	allowedPrefixes := []string{
+		"LC_", "XDG_", "GIT_",
+		"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "no_proxy",
+		"NVM_", "PYENV_", "RBENV_", "GOPATH", "GOROOT", "GOENV", "GOBIN",
+		"CARGO_HOME", "RUSTUP_HOME",
+		"JAVA_HOME", "ANDROID_HOME", "ANDROID_SDK_ROOT",
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		key := kv
+		if idx := strings.IndexByte(kv, '='); idx >= 0 {
+			key = kv[:idx]
+		}
+		if allowed[key] {
+			env = append(env, kv)
+			continue
+		}
+		for _, p := range allowedPrefixes {
+			if strings.HasPrefix(key, p) {
+				env = append(env, kv)
+				break
+			}
+		}
+	}
+	return env
 }
