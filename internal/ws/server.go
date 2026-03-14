@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"bufio"
 	"net"
 	"net/http"
 	"net/url"
@@ -123,9 +124,18 @@ type directSessionState struct {
 	shimClientID    string    // WS client ID of the shim that owns this session
 	cwd             string
 	claudeSessionID string    // Claude Code's own session_id from the SessionStart hook
+	jsonlPath       string    // path to Claude Code's JSONL transcript for this session
 	createdAt       time.Time
 	buf             []byte    // ring buffer of raw PTY output (last ~32 KB)
 	subscribers     []string  // iOS client IDs subscribed via open_pty
+}
+
+// ChatTurn is one user→assistant exchange, parsed from the Claude Code JSONL transcript.
+type ChatTurn struct {
+	UserText  string `json:"user_text"`
+	ClaudeText string `json:"claude_text"`
+	ToolCount int    `json:"tool_count"`
+	Timestamp string `json:"timestamp"` // ISO 8601
 }
 
 const directBufMax = 256 * 1024 // 256 KB ring buffer per direct session
@@ -893,6 +903,8 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			case client.send <- paneMsg:
 			default:
 			}
+			// Send parsed chat history from Claude Code's JSONL transcript.
+			go s.sendChatHistory(msg.Session)
 			break
 		}
 		if s.ptyMgr == nil {
@@ -1665,6 +1677,7 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 				ds.cwd = cwd
 				if claudeSessionID != "" {
 					ds.claudeSessionID = claudeSessionID
+					ds.jsonlPath = claudeJSONLPath(cwd, claudeSessionID)
 				}
 			}
 			s.directSessionsMu.Unlock()
@@ -1733,6 +1746,8 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			Content:   lastMsg,
 			Timestamp: time.Now(),
 		})
+		// Re-read transcript now that the turn is complete and push to iOS.
+		go s.sendChatHistory(sessionName)
 		w.WriteHeader(http.StatusOK)
 	case "PreToolUse":
 		s.sessionWatch.Emit(watcher.Event{
@@ -1899,6 +1914,153 @@ func (s *Server) dialRelay(ctx context.Context, wsURL string) error {
 
 		s.handleInbound(ctx, client, msg)
 	}
+}
+
+// claudeJSONLPath returns the path to Claude Code's JSONL transcript.
+// Claude encodes the project path by replacing every '/' with '-'.
+func claudeJSONLPath(cwd, sessionID string) string {
+	home, _ := os.UserHomeDir()
+	encoded := strings.ReplaceAll(cwd, "/", "-")
+	return filepath.Join(home, ".claude", "projects", encoded, sessionID+".jsonl")
+}
+
+// parseChatHistory reads Claude Code's JSONL transcript and returns completed turns.
+// A turn is one user message followed by the accumulated assistant response.
+func parseChatHistory(path string) []ChatTurn {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	type contentItem struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	type jsonlMsg struct {
+		Content json.RawMessage `json:"content"`
+	}
+	type jsonlRecord struct {
+		Type      string   `json:"type"`
+		Message   jsonlMsg `json:"message"`
+		Timestamp string   `json:"timestamp"`
+	}
+
+	extractText := func(raw json.RawMessage) string {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return strings.TrimSpace(s)
+		}
+		var items []contentItem
+		if json.Unmarshal(raw, &items) == nil {
+			var parts []string
+			for _, item := range items {
+				if item.Type == "text" {
+					if t := strings.TrimSpace(item.Text); t != "" {
+						parts = append(parts, t)
+					}
+				}
+			}
+			return strings.Join(parts, "\n")
+		}
+		return ""
+	}
+
+	countTools := func(raw json.RawMessage) int {
+		var items []contentItem
+		if json.Unmarshal(raw, &items) != nil {
+			return 0
+		}
+		n := 0
+		for _, item := range items {
+			if item.Type == "tool_use" {
+				n++
+			}
+		}
+		return n
+	}
+
+	var turns []ChatTurn
+	var cur *ChatTurn
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MB per line for large messages
+	for scanner.Scan() {
+		var rec jsonlRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			continue
+		}
+		switch rec.Type {
+		case "user":
+			if cur != nil && cur.ClaudeText != "" {
+				turns = append(turns, *cur)
+			}
+			cur = &ChatTurn{
+				UserText:  extractText(rec.Message.Content),
+				Timestamp: rec.Timestamp,
+			}
+		case "assistant":
+			if cur == nil {
+				continue
+			}
+			if t := extractText(rec.Message.Content); t != "" {
+				if cur.ClaudeText != "" {
+					cur.ClaudeText += "\n"
+				}
+				cur.ClaudeText += t
+			}
+			cur.ToolCount += countTools(rec.Message.Content)
+		}
+	}
+	// Include the last turn only if Claude has responded.
+	if cur != nil && cur.ClaudeText != "" {
+		turns = append(turns, *cur)
+	}
+	return turns
+}
+
+// sendChatHistory reads the JSONL transcript for a direct session and pushes
+// the parsed turns to all subscribed iOS clients.
+func (s *Server) sendChatHistory(session string) {
+	s.directSessionsMu.RLock()
+	ds, ok := s.directSessions[session]
+	var jsonlPath string
+	var subscribers []string
+	if ok {
+		jsonlPath = ds.jsonlPath
+		subscribers = append([]string(nil), ds.subscribers...)
+	}
+	s.directSessionsMu.RUnlock()
+
+	if !ok || jsonlPath == "" || len(subscribers) == 0 {
+		return
+	}
+
+	turns := parseChatHistory(jsonlPath)
+	if turns == nil {
+		turns = []ChatTurn{} // send empty array rather than null
+	}
+	msg, err := json.Marshal(OutboundMessage{
+		Type: "chat_history",
+		Payload: map[string]interface{}{
+			"session": session,
+			"turns":   turns,
+		},
+	})
+	if err != nil {
+		return
+	}
+
+	s.mu.RLock()
+	for _, id := range subscribers {
+		if c, ok := s.clients[id]; ok {
+			select {
+			case c.send <- msg:
+			default:
+			}
+		}
+	}
+	s.mu.RUnlock()
 }
 
 // parseOSC7CWD extracts the last OSC-7 working-directory path from a PTY data
