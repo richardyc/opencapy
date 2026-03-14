@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -118,6 +119,19 @@ func newShimCmd() *cobra.Command {
 				}
 			}()
 
+			// activeConn is the current live WS connection for sending pty_data.
+			// The reconnect goroutine swaps it when a new connection is established.
+			var connMu sync.Mutex
+			activeConn := conn
+			sendToConn := func(msg interface{}) {
+				connMu.Lock()
+				c := activeConn
+				connMu.Unlock()
+				if c != nil {
+					_ = wsjson.Write(ctx, c, msg)
+				}
+			}
+
 			// ptmx output → stdout (display) + pty_data to daemon (streaming)
 			go func() {
 				buf := make([]byte, 4096)
@@ -129,7 +143,7 @@ func newShimCmd() *cobra.Command {
 						// Strip claude's OSC title sequences so our session-name
 						// title persists and is never overridden.
 						os.Stdout.Write(oscTitleRe.ReplaceAll(chunk, nil)) //nolint:errcheck
-						_ = wsjson.Write(ctx, conn, map[string]interface{}{
+						sendToConn(map[string]interface{}{
 							"type":    "pty_data",
 							"session": sessionName,
 							"data":    base64.StdEncoding.EncodeToString(chunk),
@@ -147,7 +161,7 @@ func newShimCmd() *cobra.Command {
 						exitCode = ee.ExitCode()
 					}
 				}
-				_ = wsjson.Write(ctx, conn, map[string]interface{}{
+				sendToConn(map[string]interface{}{
 					"type":      "session_end",
 					"session":   sessionName,
 					"exit_code": exitCode,
@@ -211,8 +225,8 @@ func newShimCmd() *cobra.Command {
 			}
 
 			setTerminalTitle(fmt.Sprintf("claude · %s · running", sessionName))
-			// WS disconnected — daemon may have restarted. Try to reconnect and
-			// re-register so hook events can be matched back to this session.
+			// WS disconnected — daemon may have restarted. Reconnect, re-register,
+			// and swap activeConn so PTY data resumes flowing to the new daemon.
 			// Claude keeps running throughout; we just restore the monitoring link.
 			go func() {
 				backoff := 2 * time.Second
@@ -230,23 +244,56 @@ func newShimCmd() *cobra.Command {
 						continue
 					}
 					newConn.SetReadLimit(1 << 20)
-					// Re-register with the same session name so hook events match.
 					rereg := map[string]interface{}{
 						"type":         "reregister_session",
 						"session":      sessionName,
 						"project_path": cwd,
 						"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
 					}
-					if wsjson.Write(ctx, newConn, rereg) == nil {
-						// Drain messages silently — just keeping the session alive.
-						for {
-							var raw map[string]json.RawMessage
-							if wsjson.Read(ctx, newConn, &raw) != nil {
-								break
+					if wsjson.Write(ctx, newConn, rereg) != nil {
+						newConn.CloseNow()
+						continue
+					}
+					// Swap activeConn so the PTY output goroutine writes to the new connection.
+					connMu.Lock()
+					old := activeConn
+					activeConn = newConn
+					connMu.Unlock()
+					if old != nil {
+						old.CloseNow()
+					}
+					// Handle pty_input, pty_resize, and events from the new connection.
+					for {
+						var raw map[string]json.RawMessage
+						if wsjson.Read(ctx, newConn, &raw) != nil {
+							break
+						}
+						switch unquote(raw["type"]) {
+						case "pty_input":
+							var payload struct {
+								Data string `json:"data"`
 							}
+							if err := json.Unmarshal(raw["payload"], &payload); err == nil {
+								if decoded, err := base64.StdEncoding.DecodeString(payload.Data); err == nil {
+									ptmx.Write(decoded) //nolint:errcheck
+								}
+							}
+						case "pty_resize":
+							var payload struct {
+								Cols int `json:"cols"`
+								Rows int `json:"rows"`
+							}
+							if err := json.Unmarshal(raw["payload"], &payload); err == nil && payload.Cols > 0 && payload.Rows > 0 {
+								pty.Setsize(ptmx, &pty.Winsize{ //nolint:errcheck
+									Cols: uint16(payload.Cols),
+									Rows: uint16(payload.Rows),
+								})
+							}
+						case "event":
+							updateTitleFromEvent(sessionName, raw["payload"])
 						}
 					}
-					newConn.CloseNow()
+					// Connection dropped again — loop to reconnect.
 					backoff = 2 * time.Second
 				}
 			}()
