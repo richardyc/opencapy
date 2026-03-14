@@ -1544,18 +1544,50 @@ func (s *Server) directSessionCount() int {
 
 // findDirectSessionByCwd returns the most recently created direct session for
 // the given working directory. Used to correlate Claude Code hook events.
+//
+// Matching strategy (in order):
+//  1. Exact cwd match
+//  2. Session cwd is an ancestor of the hook cwd (user ran claude from a parent dir)
+//  3. Most recently created session as a last resort (single-session common case)
 func (s *Server) findDirectSessionByCwd(cwd string) string {
 	s.directSessionsMu.RLock()
 	defer s.directSessionsMu.RUnlock()
-	var best string
-	var bestTime time.Time
+	if len(s.directSessions) == 0 {
+		return ""
+	}
+
+	var exact, ancestor, newest string
+	var exactTime, ancestorTime, newestTime time.Time
+
 	for name, ds := range s.directSessions {
-		if ds.cwd == cwd && ds.createdAt.After(bestTime) {
-			best = name
-			bestTime = ds.createdAt
+		// 1. Exact match
+		if ds.cwd == cwd && ds.createdAt.After(exactTime) {
+			exact = name
+			exactTime = ds.createdAt
+		}
+		// 2. Session cwd is a parent directory of the hook cwd
+		if ds.cwd != cwd && strings.HasPrefix(cwd, ds.cwd+"/") && ds.createdAt.After(ancestorTime) {
+			ancestor = name
+			ancestorTime = ds.createdAt
+		}
+		// 3. Most recent overall
+		if ds.createdAt.After(newestTime) {
+			newest = name
+			newestTime = ds.createdAt
 		}
 	}
-	return best
+
+	if exact != "" {
+		return exact
+	}
+	if ancestor != "" {
+		return ancestor
+	}
+	// Only fall back to newest if there's exactly one session (unambiguous)
+	if len(s.directSessions) == 1 {
+		return newest
+	}
+	return ""
 }
 
 // handleClaudeHook receives structured events from Claude Code's hook system
