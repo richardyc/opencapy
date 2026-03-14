@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -209,10 +210,46 @@ func newShimCmd() *cobra.Command {
 				}
 			}
 
-			setTerminalTitle("")
-			// WS disconnected (daemon restarted or stopped) but claude is still
-			// running. Wait for claude to exit naturally instead of killing it.
-			// The ctx will be cancelled by the PTY goroutine when claude exits.
+			setTerminalTitle(fmt.Sprintf("claude · %s · running", sessionName))
+			// WS disconnected — daemon may have restarted. Try to reconnect and
+			// re-register so hook events can be matched back to this session.
+			// Claude keeps running throughout; we just restore the monitoring link.
+			go func() {
+				backoff := 2 * time.Second
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
+					newConn, _, err := websocket.Dial(ctx, wsURL, nil)
+					if err != nil {
+						if backoff < 30*time.Second {
+							backoff *= 2
+						}
+						continue
+					}
+					newConn.SetReadLimit(1 << 20)
+					// Re-register with the same session name so hook events match.
+					rereg := map[string]interface{}{
+						"type":         "reregister_session",
+						"session":      sessionName,
+						"project_path": cwd,
+						"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
+					}
+					if wsjson.Write(ctx, newConn, rereg) == nil {
+						// Drain messages silently — just keeping the session alive.
+						for {
+							var raw map[string]json.RawMessage
+							if wsjson.Read(ctx, newConn, &raw) != nil {
+								break
+							}
+						}
+					}
+					newConn.CloseNow()
+					backoff = 2 * time.Second
+				}
+			}()
 			<-ctx.Done()
 			return nil
 		},

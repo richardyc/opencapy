@@ -535,8 +535,16 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		}
 
 	case "send_keys":
-		if msg.Session != "" && msg.Keys != "" {
-			log.Printf("send_keys %q: %q", msg.Session, msg.Keys)
+		if msg.Session == "" || msg.Keys == "" {
+			break
+		}
+		// Default: send via PTY (direct sessions). Fall back to tmux only for tmux sessions.
+		if s.IsDirectSession(msg.Session) {
+			s.forwardToShim(msg.Session, "pty_input", map[string]string{
+				"session": msg.Session,
+				"data":    base64.StdEncoding.EncodeToString([]byte(msg.Keys + "\n")),
+			})
+		} else {
 			_ = tmux.SendKeys(msg.Session, msg.Keys)
 		}
 
@@ -673,6 +681,20 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		sendImageAck("")
 
 	// ── PTY messages ──────────────────────────────────────────────────────────
+
+	case "reregister_session":
+		// Shim reconnected after a daemon restart — restore session so hook events match.
+		if msg.Session == "" || msg.ProjectPath == "" {
+			break
+		}
+		s.directSessionsMu.Lock()
+		s.directSessions[msg.Session] = &directSessionState{
+			shimClientID: client.ID,
+			cwd:          msg.ProjectPath,
+			createdAt:    time.Now(),
+		}
+		s.directSessionsMu.Unlock()
+		log.Printf("[hook] session %q re-registered after daemon restart", msg.Session)
 
 	case "register_session":
 		// Shim owns the PTY — daemon just assigns a name and tracks the session.
@@ -1514,6 +1536,12 @@ func (s *Server) IsDirectSession(name string) bool {
 	return ok
 }
 
+func (s *Server) directSessionCount() int {
+	s.directSessionsMu.RLock()
+	defer s.directSessionsMu.RUnlock()
+	return len(s.directSessions)
+}
+
 // findDirectSessionByCwd returns the most recently created direct session for
 // the given working directory. Used to correlate Claude Code hook events.
 func (s *Server) findDirectSessionByCwd(cwd string) string {
@@ -1547,11 +1575,14 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 	}
 	hookName, _ := payload["hook_event_name"].(string)
 	cwd, _ := payload["cwd"].(string)
+	log.Printf("[hook] %s cwd=%q", hookName, cwd)
 
 	sessionName := s.findDirectSessionByCwd(cwd)
 	if sessionName == "" {
-		return // no matching session
+		log.Printf("[hook] no direct session matched cwd=%q (active sessions: %d)", cwd, s.directSessionCount())
+		return
 	}
+	log.Printf("[hook] matched session %q", sessionName)
 
 	switch hookName {
 	case "PermissionRequest":
