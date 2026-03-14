@@ -82,22 +82,27 @@ func newUpdateCmd() *cobra.Command {
 		Short: "Upgrade opencapy to the latest version and restart the daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Println("Checking for updates…")
-			exec.Command("brew", "update").Run() //nolint:errcheck
 
-			upgradeOut, _ := exec.Command("brew", "upgrade", "richardyc/opencapy/opencapy").CombinedOutput()
-			upgraded := !strings.Contains(string(upgradeOut), "already installed")
-
-			if !upgraded {
-				newBin, _ := exec.LookPath("opencapy")
-				ver, _ := exec.Command(newBin, "version").Output()
-				fmt.Printf("Already on the latest version. %s", ver)
-				return nil
+			// Prefer Homebrew when available; fall back to direct download otherwise.
+			if isBrewInstall() {
+				exec.Command("brew", "update").Run() //nolint:errcheck
+				upgradeOut, _ := exec.Command("brew", "upgrade", "richardyc/opencapy/opencapy").CombinedOutput()
+				if strings.Contains(string(upgradeOut), "already installed") {
+					newBin, _ := exec.LookPath("opencapy")
+					ver, _ := exec.Command(newBin, "version").Output()
+					fmt.Printf("Already on the latest version. %s", ver)
+					return nil
+				}
+				if strings.Contains(string(upgradeOut), "brew link") {
+					exec.Command("brew", "link", "--overwrite", "opencapy").Run() //nolint:errcheck
+				}
+				fmt.Println(strings.TrimSpace(string(upgradeOut)))
+			} else {
+				if err := selfUpdate(); err != nil {
+					return err
+				}
 			}
 
-			if strings.Contains(string(upgradeOut), "brew link") {
-				exec.Command("brew", "link", "--overwrite", "opencapy").Run() //nolint:errcheck
-			}
-			fmt.Println(strings.TrimSpace(string(upgradeOut)))
 			fmt.Println("\nRestarting daemon…")
 
 			home, _ := os.UserHomeDir()
@@ -138,6 +143,73 @@ func newUpdateCmd() *cobra.Command {
 			return fmt.Errorf("unsupported platform — restart the daemon manually")
 		},
 	}
+}
+
+// isBrewInstall returns true when the running binary lives inside a Homebrew prefix.
+func isBrewInstall() bool {
+	bin, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(bin, "Cellar") || strings.Contains(bin, "homebrew") || strings.Contains(bin, "linuxbrew")
+}
+
+// selfUpdate downloads the latest release from GitHub and replaces the running binary.
+func selfUpdate() error {
+	const repo = "richardyc/opencapy"
+
+	// Resolve latest tag via GitHub API.
+	out, err := exec.Command("curl", "-sf",
+		"https://api.github.com/repos/"+repo+"/releases/latest").Output()
+	if err != nil {
+		return fmt.Errorf("fetch latest release: %w", err)
+	}
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.Unmarshal(out, &release); err != nil || release.TagName == "" {
+		return fmt.Errorf("parse release info: %w", err)
+	}
+
+	goos := runtime.GOOS
+	goarch := runtime.GOARCH
+	if goarch == "amd64" {
+		goarch = "amd64"
+	}
+	tarball := fmt.Sprintf("opencapy_%s_%s.tar.gz", goos, goarch)
+	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, release.TagName, tarball)
+
+	fmt.Printf("Downloading %s…\n", release.TagName)
+
+	// Download to a temp dir.
+	tmp, err := os.MkdirTemp("", "opencapy-update-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+
+	archive := filepath.Join(tmp, "opencapy.tar.gz")
+	if err := exec.Command("curl", "-sL", url, "-o", archive).Run(); err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	if err := exec.Command("tar", "-xzf", archive, "-C", tmp).Run(); err != nil {
+		return fmt.Errorf("extract: %w", err)
+	}
+
+	// Replace the running binary.
+	dest, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	newBin := filepath.Join(tmp, "opencapy")
+	if err := exec.Command("cp", newBin, dest).Run(); err != nil {
+		// Retry with sudo if permission denied.
+		if err2 := exec.Command("sudo", "cp", newBin, dest).Run(); err2 != nil {
+			return fmt.Errorf("install binary (try running with sudo): %w", err)
+		}
+	}
+	fmt.Printf("✓ Updated to %s\n", release.TagName)
+	return nil
 }
 
 // killAndWait kills all running opencapy daemon processes and blocks until the
