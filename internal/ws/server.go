@@ -1536,56 +1536,37 @@ func (s *Server) IsDirectSession(name string) bool {
 	return ok
 }
 
-func (s *Server) directSessionCount() int {
-	s.directSessionsMu.RLock()
-	defer s.directSessionsMu.RUnlock()
-	return len(s.directSessions)
-}
-
-// findDirectSessionByCwd returns the most recently created direct session for
-// the given working directory. Used to correlate Claude Code hook events.
-//
-// Matching strategy (in order):
-//  1. Exact cwd match
-//  2. Session cwd is an ancestor of the hook cwd (user ran claude from a parent dir)
-//  3. Most recently created session as a last resort (single-session common case)
+// findDirectSessionByCwd returns the most recently created direct session with
+// an exact cwd match. After SessionStart updates the stored cwd this is always
+// sufficient and unambiguous.
 func (s *Server) findDirectSessionByCwd(cwd string) string {
 	s.directSessionsMu.RLock()
 	defer s.directSessionsMu.RUnlock()
-	if len(s.directSessions) == 0 {
-		return ""
-	}
-
-	var exact, ancestor, newest string
-	var exactTime, ancestorTime, newestTime time.Time
-
+	var best string
+	var bestTime time.Time
 	for name, ds := range s.directSessions {
-		// 1. Exact match
-		if ds.cwd == cwd && ds.createdAt.After(exactTime) {
-			exact = name
-			exactTime = ds.createdAt
-		}
-		// 2. Session cwd is a parent directory of the hook cwd
-		if ds.cwd != cwd && strings.HasPrefix(cwd, ds.cwd+"/") && ds.createdAt.After(ancestorTime) {
-			ancestor = name
-			ancestorTime = ds.createdAt
-		}
-		// 3. Most recent overall
-		if ds.createdAt.After(newestTime) {
-			newest = name
-			newestTime = ds.createdAt
+		if ds.cwd == cwd && ds.createdAt.After(bestTime) {
+			best = name
+			bestTime = ds.createdAt
 		}
 	}
+	return best
+}
 
-	if exact != "" {
-		return exact
+// bindSessionByCwd is used only during SessionStart to establish the session→cwd
+// mapping. Tries exact match first, then falls back to the single active session
+// (unambiguous when there is only one). After this call all subsequent hook
+// events will match exactly via findDirectSessionByCwd.
+func (s *Server) bindSessionByCwd(cwd string) string {
+	if name := s.findDirectSessionByCwd(cwd); name != "" {
+		return name
 	}
-	if ancestor != "" {
-		return ancestor
-	}
-	// Only fall back to newest if there's exactly one session (unambiguous)
+	s.directSessionsMu.RLock()
+	defer s.directSessionsMu.RUnlock()
 	if len(s.directSessions) == 1 {
-		return newest
+		for name := range s.directSessions {
+			return name
+		}
 	}
 	return ""
 }
@@ -1607,14 +1588,26 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 	}
 	hookName, _ := payload["hook_event_name"].(string)
 	cwd, _ := payload["cwd"].(string)
-	log.Printf("[hook] %s cwd=%q", hookName, cwd)
+
+	// SessionStart: update the session's stored cwd to claude's actual project
+	// directory so all subsequent hooks match exactly via findDirectSessionByCwd.
+	if hookName == "SessionStart" {
+		if name := s.bindSessionByCwd(cwd); name != "" {
+			s.directSessionsMu.Lock()
+			if ds, ok := s.directSessions[name]; ok {
+				ds.cwd = cwd
+			}
+			s.directSessionsMu.Unlock()
+			log.Printf("[hook] SessionStart: bound %q → cwd=%q", name, cwd)
+		}
+		return
+	}
 
 	sessionName := s.findDirectSessionByCwd(cwd)
 	if sessionName == "" {
-		log.Printf("[hook] no direct session matched cwd=%q (active sessions: %d)", cwd, s.directSessionCount())
+		log.Printf("[hook] %s: no session for cwd=%q", hookName, cwd)
 		return
 	}
-	log.Printf("[hook] matched session %q", sessionName)
 
 	switch hookName {
 	case "PermissionRequest":
@@ -1629,7 +1622,7 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 		})
 	case "Stop":
 		if active, _ := payload["stop_hook_active"].(bool); active {
-			return // already in a stop hook continuation, skip to avoid loops
+			return // already in a stop hook loop, skip
 		}
 		lastMsg, _ := payload["last_assistant_message"].(string)
 		s.sessionWatch.Emit(watcher.Event{
@@ -1639,7 +1632,6 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			Timestamp: time.Now(),
 		})
 	}
-
 }
 
 // BroadcastFileEvent marshals a FileEvent and broadcasts it to all connected clients.

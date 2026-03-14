@@ -186,7 +186,7 @@ func injectClaudeHooks() {
 	if hooks == nil {
 		hooks = make(map[string]interface{})
 	}
-	for _, event := range []string{"PermissionRequest", "Stop", "PostToolUse"} {
+	for _, event := range []string{"SessionStart", "PermissionRequest", "Stop", "PostToolUse"} {
 		existing, _ := hooks[event].([]interface{})
 		hooks[event] = append(existing, hook)
 	}
