@@ -123,6 +123,13 @@ func newShimCmd() *cobra.Command {
 			// The reconnect goroutine swaps it when a new connection is established.
 			var connMu sync.Mutex
 			activeConn := conn
+
+			// shimBuf is a local ring buffer of recent PTY output (capped at 256 KB).
+			// Replayed in reregister_session so the daemon can restore ds.buf after
+			// a restart, giving iOS history when reconnecting to old sessions.
+			const shimBufMax = 256 * 1024
+			var shimBuf []byte
+
 			sendToConn := func(msg interface{}) {
 				connMu.Lock()
 				c := activeConn
@@ -140,6 +147,13 @@ func newShimCmd() *cobra.Command {
 					if n > 0 {
 						chunk := make([]byte, n)
 						copy(chunk, buf[:n])
+						// Keep a local ring buffer so we can replay history on reconnect.
+						connMu.Lock()
+						shimBuf = append(shimBuf, chunk...)
+						if len(shimBuf) > shimBufMax {
+							shimBuf = shimBuf[len(shimBuf)-shimBufMax:]
+						}
+						connMu.Unlock()
 						// Strip claude's OSC title sequences so our session-name
 						// title persists and is never overridden.
 						os.Stdout.Write(oscTitleRe.ReplaceAll(chunk, nil)) //nolint:errcheck
@@ -244,11 +258,16 @@ func newShimCmd() *cobra.Command {
 						continue
 					}
 					newConn.SetReadLimit(1 << 20)
+					connMu.Lock()
+					bufSnapshot := make([]byte, len(shimBuf))
+					copy(bufSnapshot, shimBuf)
+					connMu.Unlock()
 					rereg := map[string]interface{}{
 						"type":         "reregister_session",
 						"session":      sessionName,
 						"project_path": cwd,
 						"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
+						"buf":          base64.StdEncoding.EncodeToString(bufSnapshot),
 					}
 					if wsjson.Write(ctx, newConn, rereg) != nil {
 						newConn.CloseNow()

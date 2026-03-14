@@ -62,9 +62,10 @@ type InboundMessage struct {
 	Lines int `json:"lines,omitempty"` // lines of scrollback to capture
 	// Live Activity
 	Machine string `json:"machine,omitempty"` // machine name from iOS for live activity token
-	// register_session (shim → daemon): shim owns the PTY, daemon just routes
+	// register_session / reregister_session (shim → daemon)
 	Branch   string `json:"branch,omitempty"`    // git branch at launch
 	ExitCode int    `json:"exit_code,omitempty"` // process exit code, sent in session_end
+	Buf      string `json:"buf,omitempty"`        // base64 PTY ring buffer snapshot for reregister
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -737,18 +738,26 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 	// ── PTY messages ──────────────────────────────────────────────────────────
 
 	case "reregister_session":
-		// Shim reconnected after a daemon restart — restore session so hook events match.
+		// Shim reconnected after a daemon restart — restore session so hook events
+		// and PTY streaming work again. Restore ds.buf from the shim's ring buffer
+		// snapshot so iOS gets history when reconnecting to old sessions.
 		if msg.Session == "" || msg.ProjectPath == "" {
 			break
+		}
+		var restoredBuf []byte
+		if msg.Buf != "" {
+			restoredBuf, _ = base64.StdEncoding.DecodeString(msg.Buf)
 		}
 		s.directSessionsMu.Lock()
 		s.directSessions[msg.Session] = &directSessionState{
 			shimClientID: client.ID,
 			cwd:          msg.ProjectPath,
+			buf:          restoredBuf,
 			createdAt:    time.Now(),
 		}
 		s.directSessionsMu.Unlock()
-		log.Printf("[hook] session %q re-registered after daemon restart", msg.Session)
+		log.Printf("[hook] session %q re-registered after daemon restart (buf=%d bytes)", msg.Session, len(restoredBuf))
+		go s.BroadcastSnapshot()
 
 	case "register_session":
 		// Shim owns the PTY — daemon just assigns a name and tracks the session.
