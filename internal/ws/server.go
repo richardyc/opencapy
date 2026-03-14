@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,14 +120,20 @@ type liveActivityEntry struct {
 
 // directSessionState tracks a session spawned by the claude shim (no tmux involved).
 type directSessionState struct {
-	shimClientID string    // WS client ID of the shim that owns this session
-	cwd          string
-	createdAt    time.Time
-	buf          []byte    // ring buffer of raw PTY output (last ~32 KB)
-	subscribers  []string  // iOS client IDs subscribed via open_pty
+	shimClientID    string    // WS client ID of the shim that owns this session
+	cwd             string
+	claudeSessionID string    // Claude Code's own session_id from the SessionStart hook
+	createdAt       time.Time
+	buf             []byte    // ring buffer of raw PTY output (last ~32 KB)
+	subscribers     []string  // iOS client IDs subscribed via open_pty
 }
 
-const directBufMax = 32 * 1024 // 32 KB ring buffer per direct session
+const directBufMax = 256 * 1024 // 256 KB ring buffer per direct session
+
+// daemonProtocolVersion is sent in the hello message on every new connection.
+// Increment when making breaking changes to the WebSocket protocol so the iOS
+// app can detect version skew and prompt the user to update.
+const daemonProtocolVersion = 1
 
 // New creates a new WebSocket server.
 func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
@@ -363,6 +370,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	go s.refreshTmuxStatus()
 
 	ctx := r.Context()
+
+	// Send hello immediately so the client knows the daemon protocol version.
+	// This is the first message on every connection; iOS can reject mismatches.
+	if helloMsg, err := json.Marshal(OutboundMessage{
+		Type:    "hello",
+		Payload: map[string]int{"version": daemonProtocolVersion},
+	}); err == nil {
+		select {
+		case client.send <- helloMsg:
+		default:
+		}
+	}
 
 	// Send snapshot of current sessions to newly connected client.
 	// Recover from "send on closed channel" if the client disconnects before
@@ -763,6 +782,10 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			ds.buf = append(ds.buf, decoded...)
 			if len(ds.buf) > directBufMax {
 				ds.buf = ds.buf[len(ds.buf)-directBufMax:]
+			}
+			// Passively track CWD from OSC-7 sequences emitted by the shell.
+			if cwd := parseOSC7CWD(decoded); cwd != "" {
+				ds.cwd = cwd
 			}
 			subscribers = append([]string(nil), ds.subscribers...)
 		}
@@ -1561,9 +1584,25 @@ func (s *Server) IsDirectSession(name string) bool {
 	return ok
 }
 
+// findDirectSessionByClaudeID returns the session whose claudeSessionID matches
+// the given Claude Code session_id. This is the primary hook-routing lookup —
+// it's unambiguous even when multiple sessions share the same working directory.
+func (s *Server) findDirectSessionByClaudeID(id string) string {
+	if id == "" {
+		return ""
+	}
+	s.directSessionsMu.RLock()
+	defer s.directSessionsMu.RUnlock()
+	for name, ds := range s.directSessions {
+		if ds.claudeSessionID == id {
+			return name
+		}
+	}
+	return ""
+}
+
 // findDirectSessionByCwd returns the most recently created direct session with
-// an exact cwd match. After SessionStart updates the stored cwd this is always
-// sufficient and unambiguous.
+// an exact cwd match. Used as a fallback before claudeSessionID is known.
 func (s *Server) findDirectSessionByCwd(cwd string) string {
 	s.directSessionsMu.RLock()
 	defer s.directSessionsMu.RUnlock()
@@ -1615,25 +1654,34 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 	}
 	hookName, _ := payload["hook_event_name"].(string)
 	cwd, _ := payload["cwd"].(string)
+	claudeSessionID, _ := payload["session_id"].(string)
 
-	// SessionStart: update the session's stored cwd to claude's actual project
-	// directory so all subsequent hooks match exactly via findDirectSessionByCwd.
+	// SessionStart: bind Claude Code's session_id to our session so all subsequent
+	// hooks can be routed by session_id (exact, no ambiguity across parallel sessions).
 	if hookName == "SessionStart" {
 		if name := s.bindSessionByCwd(cwd); name != "" {
 			s.directSessionsMu.Lock()
 			if ds, ok := s.directSessions[name]; ok {
 				ds.cwd = cwd
+				if claudeSessionID != "" {
+					ds.claudeSessionID = claudeSessionID
+				}
 			}
 			s.directSessionsMu.Unlock()
-			log.Printf("[hook] SessionStart: bound %q → cwd=%q", name, cwd)
+			log.Printf("[hook] SessionStart: bound %q → cwd=%q sessionID=%q", name, cwd, claudeSessionID)
 		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	sessionName := s.findDirectSessionByCwd(cwd)
+	// Route by session_id first (unambiguous when multiple sessions share a cwd),
+	// fall back to cwd for hooks that arrive before SessionStart completes.
+	sessionName := s.findDirectSessionByClaudeID(claudeSessionID)
 	if sessionName == "" {
-		log.Printf("[hook] %s: no session for cwd=%q", hookName, cwd)
+		sessionName = s.findDirectSessionByCwd(cwd)
+	}
+	if sessionName == "" {
+		log.Printf("[hook] %s: no session for sessionID=%q cwd=%q", hookName, claudeSessionID, cwd)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1851,4 +1899,39 @@ func (s *Server) dialRelay(ctx context.Context, wsURL string) error {
 
 		s.handleInbound(ctx, client, msg)
 	}
+}
+
+// parseOSC7CWD extracts the last OSC-7 working-directory path from a PTY data
+// chunk. Returns "" if no OSC-7 sequence is present.
+//
+// Format: ESC ] 7 ; file://hostname/path BEL   (or ST = ESC \)
+// Emitted by modern shells (zsh, bash with vte.sh, fish) on every prompt,
+// giving us a live CWD without polling.
+func parseOSC7CWD(data []byte) string {
+	const osc7Prefix = "\x1b]7;"
+	s := string(data)
+	idx := strings.LastIndex(s, osc7Prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := s[idx+len(osc7Prefix):]
+	end := strings.IndexAny(rest, "\x07\x1b")
+	if end < 0 {
+		return ""
+	}
+	uri := rest[:end]
+	if !strings.HasPrefix(uri, "file://") {
+		return ""
+	}
+	// Strip scheme and host: file://hostname/path → /path
+	hostPath := uri[len("file://"):]
+	slash := strings.IndexByte(hostPath, '/')
+	if slash < 0 {
+		return ""
+	}
+	path, err := url.PathUnescape(hostPath[slash:])
+	if err != nil {
+		return hostPath[slash:]
+	}
+	return path
 }
