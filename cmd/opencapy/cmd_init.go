@@ -140,11 +140,12 @@ func injectFish(home string) {
 // ── Claude Code hooks ──────────────────────────────────────────────────────
 
 const claudeHooksURL = "http://localhost:7242/hooks/claude"
-const claudeHookCmd = "curl -sf -X POST " + claudeHooksURL + " -H 'Content-Type: application/json' -d @- || true"
+const claudeHookCmd = "curl -sf -X POST \"" + claudeHooksURL + "?session=$OPENCAPY_SESSION\" -H 'Content-Type: application/json' -d @- || true"
 
 // injectClaudeHooks merges opencapy's hooks into ~/.claude/settings.json.
-// Uses curl + async:true so claude is never blocked if the daemon is slow.
-// Idempotent — skips if the URL is already present.
+// Most hooks use async:true so claude is never blocked. PermissionRequest is
+// sync so the daemon can return the approval decision directly to Claude Code.
+// Idempotent — removes stale opencapy hooks first, then re-adds with correct config.
 func injectClaudeHooks() {
 	home, _ := os.UserHomeDir()
 	path := filepath.Join(home, ".claude", "settings.json")
@@ -154,16 +155,9 @@ func injectClaudeHooks() {
 		return
 	}
 
-	// Skip if already configured.
-	if strings.Contains(string(data), claudeHooksURL) {
-		fmt.Println("✓ Claude Code hooks already configured")
-		return
-	}
-
 	var settings map[string]interface{}
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, &settings); err != nil {
-			// JSONC or unparseable — print manual instructions.
 			fmt.Println("\n  Claude Code hooks — add manually to ~/.claude/settings.json:")
 			printHooksSnippet()
 			return
@@ -172,7 +166,38 @@ func injectClaudeHooks() {
 		settings = make(map[string]interface{})
 	}
 
-	hook := map[string]interface{}{
+	// Remove any existing opencapy hooks so we always write the latest config.
+	hooks, _ := settings["hooks"].(map[string]interface{})
+	if hooks == nil {
+		hooks = make(map[string]interface{})
+	}
+	for event, val := range hooks {
+		groups, _ := val.([]interface{})
+		var kept []interface{}
+		for _, g := range groups {
+			group, _ := g.(map[string]interface{})
+			inner, _ := group["hooks"].([]interface{})
+			var keptInner []interface{}
+			for _, h := range inner {
+				hm, _ := h.(map[string]interface{})
+				if cmd, _ := hm["command"].(string); strings.Contains(cmd, claudeHooksURL) {
+					continue
+				}
+				keptInner = append(keptInner, h)
+			}
+			if len(keptInner) > 0 {
+				group["hooks"] = keptInner
+				kept = append(kept, group)
+			}
+		}
+		if len(kept) > 0 {
+			hooks[event] = kept
+		} else {
+			delete(hooks, event)
+		}
+	}
+
+	asyncHook := map[string]interface{}{
 		"hooks": []interface{}{
 			map[string]interface{}{
 				"type":    "command",
@@ -181,15 +206,23 @@ func injectClaudeHooks() {
 			},
 		},
 	}
+	syncHook := map[string]interface{}{
+		"hooks": []interface{}{
+			map[string]interface{}{
+				"type":    "command",
+				"command": claudeHookCmd,
+			},
+		},
+	}
 
-	hooks, _ := settings["hooks"].(map[string]interface{})
-	if hooks == nil {
-		hooks = make(map[string]interface{})
-	}
-	for _, event := range []string{"SessionStart", "PermissionRequest", "Stop", "PostToolUse"} {
+	for _, event := range []string{"SessionStart", "Stop", "PostToolUse"} {
 		existing, _ := hooks[event].([]interface{})
-		hooks[event] = append(existing, hook)
+		hooks[event] = append(existing, asyncHook)
 	}
+	// PermissionRequest must be sync so the daemon can return the approval
+	// decision JSON and Claude Code reads it instead of showing a terminal prompt.
+	existing, _ := hooks["PermissionRequest"].([]interface{})
+	hooks["PermissionRequest"] = append(existing, syncHook)
 	settings["hooks"] = hooks
 
 	out, err := json.MarshalIndent(settings, "", "  ")

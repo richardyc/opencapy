@@ -51,7 +51,7 @@ Download on the App Store or TestFlight. Source: [richardyc/opencapy-ios](https:
 - Event timeline — approval prompts, task completion, crashes
 - Voice input — on-device speech recognition, no API key needed
 - Push notifications and lock screen Live Activities when app is backgrounded
-- Session list with live status indicators (pulsing green for active, solid green for recently active)
+- Session list with tinted glass cards, last user message preview, model name display
 - Create and delete sessions from iOS
 - Auto-reconnects when network/VPN comes back
 - **Relay connection** — scan QR, done. No VPN, no port forwarding, works with any existing VPN
@@ -100,7 +100,8 @@ opencapy version            # print version + build info
 5. For approval events, the daemon scans a wider 50-line window to extract the `⏺ ToolName(...)` context shown in the iOS prompt card
 6. PTY creation is two-step: first `tmux new-session -d` (detached, synchronous) to create the grouped session and apply styling (`status-style bg=#7B5B3A,fg=#F5E6D3`) and disable mouse (`set-option mouse off`), then `attach-session` opens the PTY. Mouse is explicitly disabled on the grouped session to prevent tmux from emitting mouse-tracking escape sequences that would intercept iOS UIScrollView pan gestures in SwiftTerm
 7. Native image paste: iOS sends PNG bytes → daemon writes to `/tmp`, sets Mac clipboard via `osascript`, sends `C-v` to the tmux session → Claude Code pastes the image inline
-8. When the iOS app is backgrounded, push notifications are delivered via APNs
+8. For direct sessions (claude shim), the daemon reads Claude Code's JSONL transcript to provide chat history and last user message previews in the session list
+9. When the iOS app is backgrounded, push notifications are delivered via APNs
 
 ## iOS connectivity
 
@@ -117,7 +118,7 @@ The daemon exposes a WebSocket server on port 7242.
 ### Daemon → iOS
 | Message type | Description |
 |---|---|
-| `snapshot` | Full session list on connect (name, projectPath, lastOutput, created, lastActive, recentEvents) |
+| `snapshot` | Full session list on connect (name, projectPath, lastOutput, created, lastActive, recentEvents, lastUserMessage) |
 | `event` | Claude Code event (approval/thinking/file_edit/crash/done/output) |
 | `file_event` | File changed by Claude Code (path, content, deleted flag) |
 | `file_tree` | Directory tree response (depth 3, excludes .git, node_modules, *.key, *.pem) |
@@ -127,6 +128,7 @@ The daemon exposes a WebSocket server on port 7242.
 | `pty_output` | Raw terminal bytes (base64, sent only to owning client) |
 | `session_created` | New session created via iOS request |
 | `image_pasted` | Clipboard set and C-v sent; iOS should refocus terminal (no compose bar shown) |
+| `chat_history` | Parsed JSONL transcript as user→assistant turns (session, turns[]) |
 | `pong` | Heartbeat response |
 | `error` | Error message |
 
@@ -149,6 +151,7 @@ The daemon exposes a WebSocket server on port 7242.
 | `pty_input` | Send bytes to PTY (base64) |
 | `pty_resize` | Resize PTY (cols/rows) |
 | `close_pty` | Close PTY |
+| `request_chat_history` | Request parsed JSONL transcript for a direct session |
 | `register_live_activity` | Register per-activity APNs push token for a session (fields: session, token, machine) |
 | `ping` | Heartbeat (30s interval) |
 

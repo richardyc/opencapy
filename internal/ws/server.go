@@ -70,13 +70,18 @@ type InboundMessage struct {
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
 type SessionSnapshot struct {
-	Name         string          `json:"name"`
-	ProjectPath  string          `json:"project_path"`
-	LastOutput   string          `json:"last_output"` // last 20 lines of pane
-	Created      time.Time       `json:"created"`
-	LastActive   time.Time       `json:"last_active"`
-	RecentEvents []watcher.Event `json:"recent_events,omitempty"`
-	SessionType  string          `json:"session_type"` // "tmux" or "direct"
+	Name            string          `json:"name"`
+	ProjectPath     string          `json:"project_path"`
+	LastOutput      string          `json:"last_output"` // last 20 lines of pane
+	Created         time.Time       `json:"created"`
+	LastActive      time.Time       `json:"last_active"`
+	RecentEvents    []watcher.Event `json:"recent_events,omitempty"`
+	SessionType     string          `json:"session_type"`                // "tmux" or "direct"
+	LastUserMessage string          `json:"last_user_message,omitempty"` // last user input from JSONL transcript
+	Branch          string          `json:"branch,omitempty"`            // git branch at session launch
+	ModelName       string          `json:"model_name,omitempty"`        // e.g. "claude-opus-4-6"
+	ContextTokens   int             `json:"context_tokens,omitempty"`    // cumulative input tokens from last assistant msg
+	MaxContext      int             `json:"max_context,omitempty"`       // model context window size
 }
 
 // Client represents a connected iOS device.
@@ -124,11 +129,16 @@ type liveActivityEntry struct {
 type directSessionState struct {
 	shimClientID    string    // WS client ID of the shim that owns this session
 	cwd             string
+	branch          string    // git branch at launch
 	claudeSessionID string    // Claude Code's own session_id from the SessionStart hook
 	jsonlPath       string    // path to Claude Code's JSONL transcript for this session
 	createdAt       time.Time
 	buf             []byte    // ring buffer of raw PTY output (last ~32 KB)
 	subscribers     []string  // iOS client IDs subscribed via open_pty
+	// Cached JSONL metadata — only re-parsed when file size changes.
+	cachedModel     string
+	cachedTokens    int
+	cachedJSONLSize int64
 }
 
 // ChatTurn is one user→assistant exchange, parsed from the Claude Code JSONL transcript.
@@ -603,10 +613,19 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			_ = tmux.SendKeys(msg.Session, msg.Keys)
 		}
 
+	case "request_chat_history":
+		if msg.Session != "" {
+			go s.sendChatHistory(msg.Session)
+		}
+
 	case "kill_session":
 		if msg.Session != "" {
+			// Direct sessions are owned by the Mac terminal — skip.
+			if s.IsDirectSession(msg.Session) {
+				log.Printf("kill_session %q: ignored (direct session)", msg.Session)
+				break
+			}
 			log.Printf("kill_session: killing %q", msg.Session)
-			// Close any open PTY for this session before killing it.
 			if s.ptyMgr != nil {
 				s.ptyMgr.Close(msg.Session)
 			}
@@ -615,16 +634,13 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			} else {
 				log.Printf("kill_session %q: done", msg.Session)
 			}
-			// Stop the watcher from polling a dead session.
 			if s.sessionWatch != nil {
 				s.sessionWatch.RemoveSession(msg.Session)
 			}
-			// Unregister from the project registry so it doesn't reappear.
 			if s.registry != nil {
 				_ = s.registry.Unregister(msg.Session)
 				_ = s.registry.Save()
 			}
-			// Broadcast updated session list immediately.
 			go s.BroadcastSnapshot()
 		}
 
@@ -748,6 +764,9 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Buf != "" {
 			restoredBuf, _ = base64.StdEncoding.DecodeString(msg.Buf)
 		}
+		// Don't assign claudeSessionID here — let the SessionStart hook bind
+		// the correct ID when Claude Code actually runs. This avoids multiple
+		// shims in the same project all claiming the same JSONL transcript.
 		s.directSessionsMu.Lock()
 		s.directSessions[msg.Session] = &directSessionState{
 			shimClientID: client.ID,
@@ -756,7 +775,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			createdAt:    time.Now(),
 		}
 		s.directSessionsMu.Unlock()
-		log.Printf("[hook] session %q re-registered after daemon restart (buf=%d bytes)", msg.Session, len(restoredBuf))
+		log.Printf("[hook] session %q re-registered (buf=%d bytes)", msg.Session, len(restoredBuf))
 		go s.BroadcastSnapshot()
 
 	case "register_session":
@@ -769,6 +788,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		s.directSessions[sessionName] = &directSessionState{
 			shimClientID: client.ID,
 			cwd:          msg.ProjectPath,
+			branch:       msg.Branch,
 			createdAt:    time.Now(),
 		}
 		s.directSessionsMu.Unlock()
@@ -1561,7 +1581,7 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 		s.recentMu.RLock()
 		recent := append([]watcher.Event{}, s.recentEvents[name]...)
 		s.recentMu.RUnlock()
-		snapshots = append(snapshots, SessionSnapshot{
+		snap := SessionSnapshot{
 			Name:         name,
 			ProjectPath:  ds.cwd,
 			LastOutput:   string(ds.buf),
@@ -1569,7 +1589,28 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 			LastActive:   ds.createdAt,
 			RecentEvents: recent,
 			SessionType:  "direct",
-		})
+			Branch:       ds.branch,
+		}
+		if ds.jsonlPath != "" {
+			snap.LastUserMessage = lastUserMessageFromJSONL(ds.jsonlPath)
+			// Only re-parse JSONL metadata when the file has grown.
+			var fileSize int64
+			if info, err := os.Stat(ds.jsonlPath); err == nil {
+				fileSize = info.Size()
+			}
+			if fileSize != ds.cachedJSONLSize {
+				model, tokens := sessionMetaFromJSONL(ds.jsonlPath)
+				ds.cachedModel = model
+				ds.cachedTokens = tokens
+				ds.cachedJSONLSize = fileSize
+			}
+			snap.ModelName = ds.cachedModel
+			snap.ContextTokens = ds.cachedTokens
+			if ds.cachedModel != "" {
+				snap.MaxContext = maxContextForModel(ds.cachedModel)
+			}
+		}
+		snapshots = append(snapshots, snap)
 	}
 	s.directSessionsMu.RUnlock()
 
@@ -1605,56 +1646,7 @@ func (s *Server) IsDirectSession(name string) bool {
 	return ok
 }
 
-// findDirectSessionByClaudeID returns the session whose claudeSessionID matches
-// the given Claude Code session_id. This is the primary hook-routing lookup —
-// it's unambiguous even when multiple sessions share the same working directory.
-func (s *Server) findDirectSessionByClaudeID(id string) string {
-	if id == "" {
-		return ""
-	}
-	s.directSessionsMu.RLock()
-	defer s.directSessionsMu.RUnlock()
-	for name, ds := range s.directSessions {
-		if ds.claudeSessionID == id {
-			return name
-		}
-	}
-	return ""
-}
 
-// findDirectSessionByCwd returns the most recently created direct session with
-// an exact cwd match. Used as a fallback before claudeSessionID is known.
-func (s *Server) findDirectSessionByCwd(cwd string) string {
-	s.directSessionsMu.RLock()
-	defer s.directSessionsMu.RUnlock()
-	var best string
-	var bestTime time.Time
-	for name, ds := range s.directSessions {
-		if ds.cwd == cwd && ds.createdAt.After(bestTime) {
-			best = name
-			bestTime = ds.createdAt
-		}
-	}
-	return best
-}
-
-// bindSessionByCwd is used only during SessionStart to establish the session→cwd
-// mapping. Tries exact match first, then falls back to the single active session
-// (unambiguous when there is only one). After this call all subsequent hook
-// events will match exactly via findDirectSessionByCwd.
-func (s *Server) bindSessionByCwd(cwd string) string {
-	if name := s.findDirectSessionByCwd(cwd); name != "" {
-		return name
-	}
-	s.directSessionsMu.RLock()
-	defer s.directSessionsMu.RUnlock()
-	if len(s.directSessions) == 1 {
-		for name := range s.directSessions {
-			return name
-		}
-	}
-	return ""
-}
 
 // handleClaudeHook receives structured events from Claude Code's hook system
 // and emits them to iOS clients. This replaces the fragile PTY string-matching
@@ -1677,33 +1669,26 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 	cwd, _ := payload["cwd"].(string)
 	claudeSessionID, _ := payload["session_id"].(string)
 
-	// SessionStart: bind Claude Code's session_id to our session so all subsequent
-	// hooks can be routed by session_id (exact, no ambiguity across parallel sessions).
-	if hookName == "SessionStart" {
-		if name := s.bindSessionByCwd(cwd); name != "" {
-			s.directSessionsMu.Lock()
-			if ds, ok := s.directSessions[name]; ok {
-				ds.cwd = cwd
-				if claudeSessionID != "" {
-					ds.claudeSessionID = claudeSessionID
-					ds.jsonlPath = claudeJSONLPath(cwd, claudeSessionID)
-				}
-			}
-			s.directSessionsMu.Unlock()
-			log.Printf("[hook] SessionStart: bound %q → cwd=%q sessionID=%q", name, cwd, claudeSessionID)
-		}
+	// Session name comes from the OPENCAPY_SESSION env var, passed as ?session= query param.
+	sessionName := r.URL.Query().Get("session")
+	if sessionName == "" {
+		log.Printf("[hook] %s: no session in query param (cwd=%q)", hookName, cwd)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Route by session_id first (unambiguous when multiple sessions share a cwd),
-	// fall back to cwd for hooks that arrive before SessionStart completes.
-	sessionName := s.findDirectSessionByClaudeID(claudeSessionID)
-	if sessionName == "" {
-		sessionName = s.findDirectSessionByCwd(cwd)
-	}
-	if sessionName == "" {
-		log.Printf("[hook] %s: no session for sessionID=%q cwd=%q", hookName, claudeSessionID, cwd)
+	// SessionStart: bind Claude Code's session_id and JSONL path.
+	if hookName == "SessionStart" {
+		s.directSessionsMu.Lock()
+		if ds, ok := s.directSessions[sessionName]; ok {
+			ds.cwd = cwd
+			if claudeSessionID != "" {
+				ds.claudeSessionID = claudeSessionID
+				ds.jsonlPath = claudeJSONLPath(cwd, claudeSessionID)
+			}
+		}
+		s.directSessionsMu.Unlock()
+		log.Printf("[hook] SessionStart: %q → cwd=%q sessionID=%q", sessionName, cwd, claudeSessionID)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1931,6 +1916,153 @@ func claudeJSONLPath(cwd, sessionID string) string {
 	home, _ := os.UserHomeDir()
 	encoded := strings.ReplaceAll(cwd, "/", "-")
 	return filepath.Join(home, ".claude", "projects", encoded, sessionID+".jsonl")
+}
+
+// latestJSONLPath finds the most recently modified .jsonl file in the Claude
+// projects directory for the given cwd. Used after daemon restart when the
+// claude session ID is unknown.
+func latestJSONLPath(cwd string) string {
+	home, _ := os.UserHomeDir()
+	encoded := strings.ReplaceAll(cwd, "/", "-")
+	dir := filepath.Join(home, ".claude", "projects", encoded)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var best string
+	var bestTime time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(bestTime) {
+			bestTime = info.ModTime()
+			best = filepath.Join(dir, e.Name())
+		}
+	}
+	return best
+}
+
+// lastUserMessageFromJSONL reads the JSONL transcript and returns the last
+// user message text, truncated to 80 chars. Scans the full file but only
+// keeps the most recent "user" record — lightweight enough for snapshot builds.
+func lastUserMessageFromJSONL(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	type contentItem struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	type jsonlMsg struct {
+		Content json.RawMessage `json:"content"`
+	}
+	type rec struct {
+		Type    string   `json:"type"`
+		Message jsonlMsg `json:"message"`
+	}
+
+	extractText := func(raw json.RawMessage) string {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			return strings.TrimSpace(s)
+		}
+		var items []contentItem
+		if json.Unmarshal(raw, &items) == nil {
+			var parts []string
+			for _, item := range items {
+				if item.Type == "text" {
+					if t := strings.TrimSpace(item.Text); t != "" {
+						parts = append(parts, t)
+					}
+				}
+			}
+			return strings.Join(parts, "\n")
+		}
+		return ""
+	}
+
+	var last string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	for scanner.Scan() {
+		var r rec
+		if json.Unmarshal(scanner.Bytes(), &r) != nil {
+			continue
+		}
+		if r.Type == "user" {
+			if t := extractText(r.Message.Content); t != "" {
+				last = t
+			}
+		}
+	}
+	// Truncate to first line, max 80 chars — used as a session title/preview.
+	if idx := strings.IndexByte(last, '\n'); idx >= 0 {
+		last = last[:idx]
+	}
+	if len(last) > 80 {
+		last = last[:77] + "…"
+	}
+	return last
+}
+
+// sessionMetaFromJSONL reads the JSONL transcript and extracts the model name
+// and cumulative input token count from the most recent assistant message.
+func sessionMetaFromJSONL(path string) (modelName string, inputTokens int) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0
+	}
+	defer f.Close()
+
+	type usage struct {
+		InputTokens            int `json:"input_tokens"`
+		CacheCreationTokens    int `json:"cache_creation_input_tokens"`
+		CacheReadTokens        int `json:"cache_read_input_tokens"`
+	}
+	type msg struct {
+		Model string `json:"model"`
+		Usage usage  `json:"usage"`
+	}
+	type rec struct {
+		Type    string `json:"type"`
+		Message msg    `json:"message"`
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	for scanner.Scan() {
+		var r rec
+		if json.Unmarshal(scanner.Bytes(), &r) != nil {
+			continue
+		}
+		if r.Type == "assistant" && r.Message.Model != "" {
+			modelName = r.Message.Model
+			u := r.Message.Usage
+			inputTokens = u.InputTokens + u.CacheCreationTokens + u.CacheReadTokens
+		}
+	}
+	return modelName, inputTokens
+}
+
+// maxContextForModel returns the context window size for a given Claude model ID.
+func maxContextForModel(model string) int {
+	switch {
+	case strings.Contains(model, "opus-4-6"),
+		strings.Contains(model, "sonnet-4-6"):
+		return 1_000_000
+	case strings.Contains(model, "haiku"):
+		return 200_000
+	default:
+		return 200_000
+	}
 }
 
 // parseChatHistory reads Claude Code's JSONL transcript and returns completed turns.

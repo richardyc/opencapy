@@ -84,7 +84,7 @@ func newShimCmd() *cobra.Command {
 
 			// Spawn claude in the user's context — natural env, no TCC prompts.
 			claudeCmd := exec.Command(claudePath, args...)
-			claudeCmd.Env = filteredEnv()
+			claudeCmd.Env = append(filteredEnv(), "OPENCAPY_SESSION="+sessionName)
 			claudeCmd.Dir = cwd
 			ptmx, err := pty.StartWithSize(claudeCmd, &pty.Winsize{
 				Cols: uint16(cols),
@@ -340,12 +340,17 @@ func waitSessionAssigned(ctx context.Context, conn *websocket.Conn) (string, err
 	}
 }
 
-// updateTitleFromEvent updates the terminal title on approval/done/crash events.
+// updateTitleFromEvent updates the terminal title on approval/done/crash events,
+// but only if the event belongs to this shim's session.
 func updateTitleFromEvent(sessionName string, payloadRaw json.RawMessage) {
 	var payload struct {
-		Type string `json:"type"`
+		Type    string `json:"type"`
+		Session string `json:"session"`
 	}
 	if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+		return
+	}
+	if payload.Session != sessionName {
 		return
 	}
 	switch payload.Type {
