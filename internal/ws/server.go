@@ -65,7 +65,8 @@ type InboundMessage struct {
 	// register_session / reregister_session (shim → daemon)
 	Branch   string `json:"branch,omitempty"`    // git branch at launch
 	ExitCode int    `json:"exit_code,omitempty"` // process exit code, sent in session_end
-	Buf      string `json:"buf,omitempty"`        // base64 PTY ring buffer snapshot for reregister
+	Buf        string `json:"buf,omitempty"`          // base64 PTY ring buffer snapshot for reregister
+	InsideTmux bool   `json:"inside_tmux,omitempty"` // true when shim is running inside a tmux session
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -102,8 +103,9 @@ type Server struct {
 	push         *push.Registry
 	ptyMgr       *ptymanager.Manager
 	mu           sync.RWMutex
-	recentEvents map[string][]watcher.Event // last 50 non-output events per session
-	recentMu     sync.RWMutex
+	recentEvents      map[string][]watcher.Event // last 50 non-output events per session
+	sessionLastActive map[string]time.Time       // last meaningful activity per session (from hooks)
+	recentMu          sync.RWMutex
 	// Live Activity push tokens: session name → per-activity APNs token from iOS
 	liveActivityTokens   map[string]liveActivityEntry
 	liveActivityTokensMu sync.RWMutex
@@ -135,6 +137,7 @@ type directSessionState struct {
 	createdAt       time.Time
 	buf             []byte    // ring buffer of raw PTY output (last ~32 KB)
 	subscribers     []string  // iOS client IDs subscribed via open_pty
+	parentTmux      string    // if set, this is a child of a tmux session (hidden from session list)
 	// Cached JSONL metadata — only re-parsed when file size changes.
 	cachedModel     string
 	cachedTokens    int
@@ -143,10 +146,26 @@ type directSessionState struct {
 
 // ChatTurn is one user→assistant exchange, parsed from the Claude Code JSONL transcript.
 type ChatTurn struct {
-	UserText  string `json:"user_text"`
-	ClaudeText string `json:"claude_text"`
-	ToolCount int    `json:"tool_count"`
-	Timestamp string `json:"timestamp"` // ISO 8601
+	UserText   string   `json:"user_text"`
+	ClaudeText string   `json:"claude_text"`
+	ToolCount  int      `json:"tool_count"`
+	ToolNames  []string `json:"tool_names"`   // e.g. ["Read server.go", "Edit auth.py"]
+	Timestamp  string   `json:"timestamp"`    // ISO 8601
+	StopReason string   `json:"stop_reason"`  // "end_turn", "tool_use", "max_tokens", etc.
+	Model      string   `json:"model"`        // e.g. "claude-opus-4-6"
+	CostUSD    float64  `json:"cost_usd"`     // from "result" record (last turn only)
+	DurationMs int      `json:"duration_ms"`  // from "result" record (last turn only)
+	NumTurns   int      `json:"num_turns"`    // from "result" record (last turn only)
+}
+
+// chatHistoryMeta holds session-level metadata parsed from the JSONL transcript.
+type chatHistoryMeta struct {
+	SessionDone bool    // true when a "result" record was found
+	IsError     bool    // true when the result indicates an error
+	CostUSD     float64 // total cost from the result record
+	DurationMs  int     // total duration from the result record
+	NumTurns    int     // number of agentic turns from the result record
+	ResultText  string  // final result text (for "result" type records)
 }
 
 const directBufMax = 256 * 1024 // 256 KB ring buffer per direct session
@@ -173,6 +192,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		push:               pushReg,
 		ptyMgr:             ptyMgr,
 		recentEvents:       make(map[string][]watcher.Event),
+		sessionLastActive:  make(map[string]time.Time),
 		liveActivityTokens: make(map[string]liveActivityEntry),
 		clientDeviceNames:  make(map[string]string),
 		directSessions:     make(map[string]*directSessionState),
@@ -197,6 +217,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/qr", s.handleQR)
 	mux.HandleFunc("/pair", s.handlePair)
 	mux.HandleFunc("/hooks/claude", s.handleClaudeHook)
+	mux.HandleFunc("/approve", s.handleHTTPApprove)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.port),
@@ -208,6 +229,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Broadcast events to all clients
 	go s.broadcastLoop(ctx)
+
+	// Watch JSONL transcripts for completion — fallback when Stop hook doesn't fire
+	// (e.g. user presses Escape/Ctrl+C to interrupt Claude).
+	go s.jsonlWatchLoop(ctx)
 
 	// Connect outbound to relay as "mac" so iOS clients can reach us.
 	if s.relayToken != "" {
@@ -564,14 +589,27 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			default:
 			}
 		} else {
-			// Fallback: no pending hook channel, send Enter to the terminal.
+			// Fallback: no pending hook channel — the hook timed out and Claude Code
+			// is showing an interactive terminal prompt. Send Escape (dismiss any
+			// autocomplete dropdown) then Enter to select the default (Allow).
 			if s.IsDirectSession(msg.Session) {
 				s.forwardToShim(msg.Session, "pty_input", map[string]string{
 					"session": msg.Session,
-					"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
+					"data":    base64.StdEncoding.EncodeToString([]byte("\x1b")),
 				})
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					s.forwardToShim(msg.Session, "pty_input", map[string]string{
+						"session": msg.Session,
+						"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
+					})
+				}()
 			} else {
-				_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
+				_ = tmux.SendRawKeys(msg.Session, []string{"Escape"})
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
+				}()
 			}
 		}
 
@@ -755,8 +793,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 
 	case "reregister_session":
 		// Shim reconnected after a daemon restart — restore session so hook events
-		// and PTY streaming work again. Restore ds.buf from the shim's ring buffer
-		// snapshot so iOS gets history when reconnecting to old sessions.
+		// and PTY streaming work again.
 		if msg.Session == "" || msg.ProjectPath == "" {
 			break
 		}
@@ -764,19 +801,71 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Buf != "" {
 			restoredBuf, _ = base64.StdEncoding.DecodeString(msg.Buf)
 		}
-		// Don't assign claudeSessionID here — let the SessionStart hook bind
-		// the correct ID when Claude Code actually runs. This avoids multiple
-		// shims in the same project all claiming the same JSONL transcript.
+		// Recover JSONL path from the persisted registry.
+		var jsonlPath, claudeID string
+		if s.registry != nil {
+			if id, ok := s.registry.GetClaudeSessionID(msg.Session); ok {
+				claudeID = id
+				jsonlPath = claudeJSONLPath(msg.ProjectPath, id)
+			}
+		}
+		// If the shim is running inside a tmux session, attach claude metadata
+		// to the parent instead of creating a separate direct session.
+		var tmuxName string
+		if msg.InsideTmux {
+			tmuxName = s.findTmuxSessionByCwd(msg.ProjectPath)
+		}
+		if tmuxName != "" {
+			s.directSessionsMu.Lock()
+			s.directSessions[msg.Session] = &directSessionState{
+				shimClientID: client.ID,
+				cwd:          msg.ProjectPath,
+				buf:          restoredBuf,
+				parentTmux:   tmuxName,
+			}
+			s.directSessionsMu.Unlock()
+			// Persist claude session ID under the tmux name so sendChatHistory works.
+			if s.registry != nil && claudeID != "" {
+				_ = s.registry.SetClaudeSessionID(tmuxName, claudeID)
+			}
+			log.Printf("[hook] session %q attached to tmux %q", msg.Session, tmuxName)
+			go s.BroadcastSnapshot()
+			go s.sendChatHistory(tmuxName)
+			break
+		}
 		s.directSessionsMu.Lock()
-		s.directSessions[msg.Session] = &directSessionState{
-			shimClientID: client.ID,
-			cwd:          msg.ProjectPath,
-			buf:          restoredBuf,
-			createdAt:    time.Now(),
+		if ds, ok := s.directSessions[msg.Session]; ok {
+			ds.shimClientID = client.ID
+			ds.cwd = msg.ProjectPath
+			ds.buf = restoredBuf
+			if msg.Branch != "" {
+				ds.branch = msg.Branch
+			}
+			if ds.jsonlPath == "" && jsonlPath != "" {
+				ds.claudeSessionID = claudeID
+				ds.jsonlPath = jsonlPath
+			}
+		} else {
+			created := time.Now()
+			if s.registry != nil {
+				if t, ok := s.registry.GetCreatedAt(msg.Session); ok {
+					created = t
+				}
+			}
+			s.directSessions[msg.Session] = &directSessionState{
+				shimClientID:    client.ID,
+				cwd:             msg.ProjectPath,
+				branch:          msg.Branch,
+				claudeSessionID: claudeID,
+				jsonlPath:       jsonlPath,
+				buf:             restoredBuf,
+				createdAt:       created,
+			}
 		}
 		s.directSessionsMu.Unlock()
 		log.Printf("[hook] session %q re-registered (buf=%d bytes)", msg.Session, len(restoredBuf))
 		go s.BroadcastSnapshot()
+		go s.sendChatHistory(msg.Session)
 
 	case "register_session":
 		// Shim owns the PTY — daemon just assigns a name and tracks the session.
@@ -784,6 +873,34 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			break
 		}
 		sessionName := directSessionName(msg.ProjectPath, msg.Branch)
+		// If the shim is inside tmux, attach as child instead of creating a separate session.
+		var tmuxName string
+		if msg.InsideTmux {
+			tmuxName = s.findTmuxSessionByCwd(msg.ProjectPath)
+		}
+		if tmuxName != "" {
+			s.directSessionsMu.Lock()
+			s.directSessions[sessionName] = &directSessionState{
+				shimClientID: client.ID,
+				cwd:          msg.ProjectPath,
+				branch:       msg.Branch,
+				parentTmux:   tmuxName,
+				createdAt:    time.Now(),
+			}
+			s.directSessionsMu.Unlock()
+			log.Printf("[hook] session %q attached to tmux %q", sessionName, tmuxName)
+			// Still send ack so the shim knows its assigned name.
+			ack, _ := json.Marshal(OutboundMessage{
+				Type:    "session_assigned",
+				Payload: map[string]string{"name": sessionName},
+			})
+			select {
+			case client.send <- ack:
+			default:
+			}
+			go s.BroadcastSnapshot()
+			break
+		}
 		s.directSessionsMu.Lock()
 		s.directSessions[sessionName] = &directSessionState{
 			shimClientID: client.ID,
@@ -794,6 +911,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		s.directSessionsMu.Unlock()
 		if s.registry != nil {
 			_ = s.registry.Register(sessionName, msg.ProjectPath)
+			s.registry.SetCreatedAt(sessionName, time.Now())
 			_ = s.registry.Save()
 		}
 		ack, _ := json.Marshal(OutboundMessage{
@@ -1323,6 +1441,7 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 				if len(s.recentEvents[ev.Session]) > 50 {
 					s.recentEvents[ev.Session] = s.recentEvents[ev.Session][len(s.recentEvents[ev.Session])-50:]
 				}
+				s.sessionLastActive[ev.Session] = ev.Timestamp
 				s.recentMu.Unlock()
 			}
 
@@ -1379,6 +1498,22 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 				if hasToken {
 					var state *push.LiveActivityContentState
 					switch ev.Type {
+					case watcher.EventRunning:
+						// Include latest pane output so Live Activity shows streaming content.
+						content := ev.Content
+						s.directSessionsMu.RLock()
+						if ds, ok := s.directSessions[ev.Session]; ok && ds.buf != nil {
+							if last := lastNLines(string(ds.buf), 3); last != "" {
+								content = last
+							}
+						}
+						s.directSessionsMu.RUnlock()
+						state = &push.LiveActivityContentState{
+							SessionName: ev.Session,
+							MachineName: entry.machineName,
+							Status:      "running",
+							LastOutput:  content,
+						}
 					case watcher.EventApproval:
 						content := ev.Content
 						state = &push.LiveActivityContentState{
@@ -1407,6 +1542,84 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 					if state != nil {
 						go s.push.SendLiveActivity(entry.token, *state)
 					}
+				}
+			}
+		}
+	}
+}
+
+// jsonlWatchLoop periodically checks each session's JSONL transcript for changes.
+// When the file stops growing and the latest turn has a Claude response, emits
+// EventDone as a fallback for when the Stop hook doesn't fire (Ctrl+C interrupt).
+// Only fires when the JSONL has been stable (no growth) for one full cycle,
+// preventing false Done events while Claude is still actively working.
+func (s *Server) jsonlWatchLoop(ctx context.Context) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	lastSize := make(map[string]int64)
+	// prevSize stores the size from TWO cycles ago — if lastSize == prevSize,
+	// the file has been stable for one full cycle.
+	prevSize := make(map[string]int64)
+	emitted := make(map[string]int64) // file size at which we last emitted Done
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.directSessionsMu.RLock()
+			sessions := make(map[string]string)
+			for name, ds := range s.directSessions {
+				if ds.jsonlPath != "" {
+					sessions[name] = ds.jsonlPath
+				}
+			}
+			s.directSessionsMu.RUnlock()
+
+			for name, path := range sessions {
+				info, err := os.Stat(path)
+				if err != nil {
+					continue
+				}
+				size := info.Size()
+				prev := lastSize[name]
+				twoCyclesAgo := prevSize[name]
+				prevSize[name] = prev
+				lastSize[name] = size
+
+				// Only act when the file has been stable for one full cycle
+				// (size unchanged between last two checks) and we haven't
+				// already emitted for this size.
+				if size == 0 || size != prev || prev != twoCyclesAgo || size == emitted[name] {
+					continue
+				}
+
+				// File is stable — check if the session is actually done.
+				// Use the "result" record (definitive) or fall back to
+				// stop_reason == "end_turn" on the last assistant message.
+				turns, meta := parseChatHistory(path)
+				if len(turns) > 0 {
+					last := turns[len(turns)-1]
+					isDone := meta.SessionDone || (last.ClaudeText != "" && last.StopReason == "end_turn")
+					if isDone {
+						emitted[name] = size
+						s.sessionWatch.Emit(watcher.Event{
+							Type:      watcher.EventDone,
+							Session:   name,
+							Content:   last.ClaudeText,
+							Timestamp: time.Now(),
+						})
+						go s.sendChatHistory(name)
+					}
+				}
+			}
+
+			for name := range lastSize {
+				if _, ok := sessions[name]; !ok {
+					delete(lastSize, name)
+					delete(prevSize, name)
+					delete(emitted, name)
 				}
 			}
 		}
@@ -1562,31 +1775,66 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 
 		s.recentMu.RLock()
 		recent := append([]watcher.Event{}, s.recentEvents[sess.Name]...)
+		lastActive := s.sessionLastActive[sess.Name]
 		s.recentMu.RUnlock()
 
-		snapshots = append(snapshots, SessionSnapshot{
+		// Use tracked last-active from meaningful events (hooks); fall back to
+		// tmux's session_activity for cold-boot ordering before any hooks have fired.
+		if lastActive.IsZero() {
+			lastActive = sess.LastActive
+		}
+		snap := SessionSnapshot{
 			Name:         sess.Name,
 			ProjectPath:  projectPath,
 			LastOutput:   strings.Join(lines, "\n"),
 			Created:      sess.Created,
-			LastActive:   sess.LastActive,
+			LastActive:   lastActive,
 			RecentEvents: recent,
 			SessionType:  "tmux",
-		})
+		}
+		// Attach claude metadata if claude is running inside this tmux session.
+		if s.registry != nil {
+			if cid, ok := s.registry.GetClaudeSessionID(sess.Name); ok {
+				jp := claudeJSONLPath(projectPath, cid)
+				snap.LastUserMessage = lastUserMessageFromJSONL(jp)
+				model, tokens := sessionMetaFromJSONL(jp)
+				snap.ModelName = model
+				snap.ContextTokens = tokens
+				if model != "" {
+					snap.MaxContext = maxContextForModel(model)
+				}
+			}
+		}
+		snapshots = append(snapshots, snap)
 	}
 
-	// Append direct (non-tmux) sessions spawned by the claude shim.
+	// Append direct (non-tmux) sessions that are NOT children of a tmux session.
 	s.directSessionsMu.RLock()
 	for name, ds := range s.directSessions {
+		if ds.parentTmux != "" {
+			continue // hidden — metadata is on the parent tmux session
+		}
 		s.recentMu.RLock()
 		recent := append([]watcher.Event{}, s.recentEvents[name]...)
+		directLastActive := s.sessionLastActive[name]
 		s.recentMu.RUnlock()
+		if directLastActive.IsZero() {
+			// Use JSONL file mod time as a proxy for last meaningful activity.
+			if ds.jsonlPath != "" {
+				if info, err := os.Stat(ds.jsonlPath); err == nil {
+					directLastActive = info.ModTime()
+				}
+			}
+			if directLastActive.IsZero() {
+				directLastActive = ds.createdAt
+			}
+		}
 		snap := SessionSnapshot{
 			Name:         name,
 			ProjectPath:  ds.cwd,
 			LastOutput:   string(ds.buf),
 			Created:      ds.createdAt,
-			LastActive:   ds.createdAt,
+			LastActive:   directLastActive,
 			RecentEvents: recent,
 			SessionType:  "direct",
 			Branch:       ds.branch,
@@ -1679,19 +1927,39 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 
 	// SessionStart: bind Claude Code's session_id and JSONL path.
 	if hookName == "SessionStart" {
+		var parentTmux string
 		s.directSessionsMu.Lock()
 		if ds, ok := s.directSessions[sessionName]; ok {
 			ds.cwd = cwd
+			parentTmux = ds.parentTmux
 			if claudeSessionID != "" {
 				ds.claudeSessionID = claudeSessionID
 				ds.jsonlPath = claudeJSONLPath(cwd, claudeSessionID)
 			}
 		}
 		s.directSessionsMu.Unlock()
-		log.Printf("[hook] SessionStart: %q → cwd=%q sessionID=%q", sessionName, cwd, claudeSessionID)
+		// Persist claude session ID — under parent tmux name if applicable.
+		persistName := sessionName
+		if parentTmux != "" {
+			persistName = parentTmux
+		}
+		if s.registry != nil && claudeSessionID != "" {
+			_ = s.registry.SetClaudeSessionID(persistName, claudeSessionID)
+		}
+		log.Printf("[hook] SessionStart: %q → %q sessionID=%q", sessionName, persistName, claudeSessionID)
+		if parentTmux != "" {
+			go s.sendChatHistory(parentTmux)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+
+	// Remap to parent tmux session so events land on the right session in iOS.
+	s.directSessionsMu.RLock()
+	if ds, ok := s.directSessions[sessionName]; ok && ds.parentTmux != "" {
+		sessionName = ds.parentTmux
+	}
+	s.directSessionsMu.RUnlock()
 
 	switch hookName {
 	case "PermissionRequest":
@@ -1704,7 +1972,7 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			Content:   content,
 			Timestamp: time.Now(),
 		})
-		// Block until iOS approves/denies or 30s timeout.
+		// Block until iOS approves/denies or 5-minute timeout.
 		// Return a JSON decision body so Claude Code handles it directly
 		// rather than falling back to an interactive terminal prompt.
 		ch := make(chan bool, 1)
@@ -1720,11 +1988,11 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 		select {
 		case approved := <-ch:
 			if approved {
-				w.Write([]byte(`{"permissionDecision":"allow"}`))
+				w.Write([]byte(`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}`))
 			} else {
-				w.Write([]byte(`{"permissionDecision":"deny"}`))
+				w.Write([]byte(`{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from iOS"}}}`))
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(5 * time.Minute):
 			// Timeout — return empty body, Claude falls back to its default.
 			w.WriteHeader(http.StatusOK)
 		}
@@ -1744,16 +2012,12 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 		go s.sendChatHistory(sessionName)
 		w.WriteHeader(http.StatusOK)
 	case "PreToolUse":
+		toolName, _ := payload["tool_name"].(string)
+		detail := toolSummary(toolName, payload["tool_input"])
 		s.sessionWatch.Emit(watcher.Event{
 			Type:      watcher.EventRunning,
 			Session:   sessionName,
-			Timestamp: time.Now(),
-		})
-		w.WriteHeader(http.StatusOK)
-	case "PostToolUse":
-		s.sessionWatch.Emit(watcher.Event{
-			Type:      watcher.EventRunning,
-			Session:   sessionName,
+			Content:   detail,
 			Timestamp: time.Now(),
 		})
 		w.WriteHeader(http.StatusOK)
@@ -1790,6 +2054,58 @@ func (s *Server) ClientCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.clients)
+}
+
+// handleHTTPApprove provides a simple HTTP endpoint for the iOS widget extension
+// to approve permissions directly, bypassing the WebSocket + Darwin notification IPC.
+// GET /approve?session=<name>&action=allow|deny
+func (s *Server) handleHTTPApprove(w http.ResponseWriter, r *http.Request) {
+	session := r.URL.Query().Get("session")
+	action := r.URL.Query().Get("action")
+	if session == "" {
+		http.Error(w, "missing session", http.StatusBadRequest)
+		return
+	}
+	if action == "" {
+		action = "allow"
+	}
+
+	approved := action == "allow"
+	s.pendingApprovalsMu.Lock()
+	ch, hasPending := s.pendingApprovals[session]
+	s.pendingApprovalsMu.Unlock()
+
+	if hasPending {
+		select {
+		case ch <- approved:
+		default:
+		}
+		w.Write([]byte(`{"ok":true,"method":"hook"}`))
+	} else {
+		// Fallback: send keystrokes to terminal.
+		if approved {
+			if s.IsDirectSession(session) {
+				s.forwardToShim(session, "pty_input", map[string]string{
+					"session": session,
+					"data":    base64.StdEncoding.EncodeToString([]byte("\x1b")),
+				})
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					s.forwardToShim(session, "pty_input", map[string]string{
+						"session": session,
+						"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
+					})
+				}()
+			} else {
+				_ = tmux.SendRawKeys(session, []string{"Escape"})
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					_ = tmux.SendRawKeys(session, []string{"Enter"})
+				}()
+			}
+		}
+		w.Write([]byte(`{"ok":true,"method":"fallback"}`))
+	}
 }
 
 // runRelayClient connects outbound to the relay as "mac" and routes messages
@@ -1912,16 +2228,10 @@ func (s *Server) dialRelay(ctx context.Context, wsURL string) error {
 
 // claudeJSONLPath returns the path to Claude Code's JSONL transcript.
 // Claude encodes the project path by replacing every '/' with '-'.
-func claudeJSONLPath(cwd, sessionID string) string {
-	home, _ := os.UserHomeDir()
-	encoded := strings.ReplaceAll(cwd, "/", "-")
-	return filepath.Join(home, ".claude", "projects", encoded, sessionID+".jsonl")
-}
-
-// latestJSONLPath finds the most recently modified .jsonl file in the Claude
-// projects directory for the given cwd. Used after daemon restart when the
-// claude session ID is unknown.
-func latestJSONLPath(cwd string) string {
+// discoverJSONLPath finds the most recently modified JSONL transcript for a
+// project by scanning ~/.claude/projects/<encoded-cwd>/. Used as a fallback
+// when the registry doesn't have the Claude session ID.
+func discoverJSONLPath(cwd string) string {
 	home, _ := os.UserHomeDir()
 	encoded := strings.ReplaceAll(cwd, "/", "-")
 	dir := filepath.Join(home, ".claude", "projects", encoded)
@@ -1929,10 +2239,10 @@ func latestJSONLPath(cwd string) string {
 	if err != nil {
 		return ""
 	}
-	var best string
+	var bestPath string
 	var bestTime time.Time
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
 			continue
 		}
 		info, err := e.Info()
@@ -1941,11 +2251,18 @@ func latestJSONLPath(cwd string) string {
 		}
 		if info.ModTime().After(bestTime) {
 			bestTime = info.ModTime()
-			best = filepath.Join(dir, e.Name())
+			bestPath = filepath.Join(dir, e.Name())
 		}
 	}
-	return best
+	return bestPath
 }
+
+func claudeJSONLPath(cwd, sessionID string) string {
+	home, _ := os.UserHomeDir()
+	encoded := strings.ReplaceAll(cwd, "/", "-")
+	return filepath.Join(home, ".claude", "projects", encoded, sessionID+".jsonl")
+}
+
 
 // lastUserMessageFromJSONL reads the JSONL transcript and returns the last
 // user message text, truncated to 80 chars. Scans the full file but only
@@ -2052,6 +2369,57 @@ func sessionMetaFromJSONL(path string) (modelName string, inputTokens int) {
 	return modelName, inputTokens
 }
 
+// findTmuxSessionByCwd returns the name of a tmux session whose cwd matches,
+// or "" if none found. Used to attach claude metadata to the parent tmux session.
+func (s *Server) findTmuxSessionByCwd(cwd string) string {
+	sessions, err := tmux.ListSessions()
+	if err != nil {
+		return ""
+	}
+	for _, sess := range sessions {
+		if sess.Cwd == cwd {
+			return sess.Name
+		}
+		// Also check registry in case tmux cwd drifted.
+		if s.registry != nil {
+			if p, ok := s.registry.GetProject(sess.Name); ok && p == cwd {
+				return sess.Name
+			}
+		}
+	}
+	return ""
+}
+
+// toolSummary builds a short description from a PreToolUse hook payload.
+// It extracts the first available detail key (file_path, command, pattern, query, url)
+// from tool_input, basenames file paths, and truncates to 50 chars.
+func toolSummary(toolName string, toolInput interface{}) string {
+	if toolName == "" {
+		return ""
+	}
+	m, ok := toolInput.(map[string]interface{})
+	if !ok {
+		return toolName
+	}
+	// Try common detail keys in priority order.
+	for _, key := range []string{"file_path", "command", "pattern", "query", "url"} {
+		v, ok := m[key].(string)
+		if !ok || v == "" {
+			continue
+		}
+		if key == "file_path" {
+			if i := strings.LastIndex(v, "/"); i >= 0 {
+				v = v[i+1:]
+			}
+		}
+		if len(v) > 50 {
+			v = v[:47] + "..."
+		}
+		return toolName + " " + v
+	}
+	return toolName
+}
+
 // maxContextForModel returns the context window size for a given Claude model ID.
 func maxContextForModel(model string) int {
 	switch {
@@ -2065,26 +2433,37 @@ func maxContextForModel(model string) int {
 	}
 }
 
-// parseChatHistory reads Claude Code's JSONL transcript and returns completed turns.
-// A turn is one user message followed by the accumulated assistant response.
-func parseChatHistory(path string) []ChatTurn {
+// parseChatHistory reads Claude Code's JSONL transcript and returns completed turns
+// plus session-level metadata (cost, duration, whether the session is done).
+func parseChatHistory(path string) ([]ChatTurn, chatHistoryMeta) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil
+		return nil, chatHistoryMeta{}
 	}
 	defer f.Close()
 
 	type contentItem struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type  string                 `json:"type"`
+		Text  string                 `json:"text"`
+		Name  string                 `json:"name"`
+		Input map[string]interface{} `json:"input"`
 	}
 	type jsonlMsg struct {
-		Content json.RawMessage `json:"content"`
+		Content    json.RawMessage `json:"content"`
+		StopReason string          `json:"stop_reason"`
+		Model      string          `json:"model"`
 	}
 	type jsonlRecord struct {
-		Type      string   `json:"type"`
-		Message   jsonlMsg `json:"message"`
-		Timestamp string   `json:"timestamp"`
+		Type       string   `json:"type"`
+		Subtype    string   `json:"subtype"`    // for "result" records: "success", "error_*"
+		Message    jsonlMsg `json:"message"`
+		Timestamp  string   `json:"timestamp"`
+		// Fields from "result" records:
+		IsError    bool     `json:"is_error"`
+		Result     string   `json:"result"`       // final text for "result" records
+		CostUSD    float64  `json:"total_cost_usd"`
+		DurationMs int      `json:"duration_ms"`
+		NumTurns   int      `json:"num_turns"`
 	}
 
 	extractText := func(raw json.RawMessage) string {
@@ -2107,22 +2486,25 @@ func parseChatHistory(path string) []ChatTurn {
 		return ""
 	}
 
-	countTools := func(raw json.RawMessage) int {
+	countTools := func(raw json.RawMessage) (int, []string) {
 		var items []contentItem
 		if json.Unmarshal(raw, &items) != nil {
-			return 0
+			return 0, nil
 		}
-		n := 0
+		var n int
+		var names []string
 		for _, item := range items {
 			if item.Type == "tool_use" {
 				n++
+				names = append(names, toolSummary(item.Name, item.Input))
 			}
 		}
-		return n
+		return n, names
 	}
 
 	var turns []ChatTurn
 	var cur *ChatTurn
+	var meta chatHistoryMeta
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MB per line for large messages
@@ -2133,16 +2515,24 @@ func parseChatHistory(path string) []ChatTurn {
 		}
 		switch rec.Type {
 		case "user":
-			if cur != nil && cur.ClaudeText != "" {
+			userText := extractText(rec.Message.Content)
+			if userText == "" {
+				// Tool-result messages have no text — they're part of the
+				// current turn's tool flow, not a new user message.
+				continue
+			}
+			if cur != nil {
 				turns = append(turns, *cur)
 			}
 			cur = &ChatTurn{
-				UserText:  extractText(rec.Message.Content),
+				UserText:  userText,
 				Timestamp: rec.Timestamp,
 			}
 		case "assistant":
 			if cur == nil {
-				continue
+				// Assistant message before any real user message — create
+				// a synthetic turn so tool counts and text aren't lost.
+				cur = &ChatTurn{Timestamp: rec.Timestamp}
 			}
 			if t := extractText(rec.Message.Content); t != "" {
 				if cur.ClaudeText != "" {
@@ -2150,42 +2540,79 @@ func parseChatHistory(path string) []ChatTurn {
 				}
 				cur.ClaudeText += t
 			}
-			cur.ToolCount += countTools(rec.Message.Content)
+			tc, tn := countTools(rec.Message.Content)
+		cur.ToolCount += tc
+		cur.ToolNames = append(cur.ToolNames, tn...)
+			if rec.Message.StopReason != "" {
+				cur.StopReason = rec.Message.StopReason
+			}
+			if rec.Message.Model != "" {
+				cur.Model = rec.Message.Model
+			}
+		case "result":
+			// The definitive "session done" record — emitted once when
+			// Claude Code finishes (success or error).
+			meta.SessionDone = true
+			meta.IsError = rec.IsError
+			meta.CostUSD = rec.CostUSD
+			meta.DurationMs = rec.DurationMs
+			meta.NumTurns = rec.NumTurns
+			meta.ResultText = rec.Result
+			// Stamp cost/duration onto the last turn for display.
+			if cur != nil {
+				cur.CostUSD = rec.CostUSD
+				cur.DurationMs = rec.DurationMs
+				cur.NumTurns = rec.NumTurns
+			}
 		}
 	}
-	// Include the last turn only if Claude has responded.
-	if cur != nil && cur.ClaudeText != "" {
+	// Always include the last turn — even if Claude hasn't responded yet —
+	// so the chat view shows the user's in-progress message.
+	if cur != nil {
 		turns = append(turns, *cur)
 	}
-	return turns
+	return turns, meta
 }
 
-// sendChatHistory reads the JSONL transcript for a direct session and pushes
-// the parsed turns to all subscribed iOS clients.
+// sendChatHistory reads the JSONL transcript for a session and broadcasts
+// the parsed turns to all connected clients.
 func (s *Server) sendChatHistory(session string) {
-	s.directSessionsMu.RLock()
-	ds, ok := s.directSessions[session]
 	var jsonlPath string
-	var subscribers []string
-	if ok {
+
+	// Check direct sessions first.
+	s.directSessionsMu.RLock()
+	if ds, ok := s.directSessions[session]; ok {
 		jsonlPath = ds.jsonlPath
-		subscribers = append([]string(nil), ds.subscribers...)
 	}
 	s.directSessionsMu.RUnlock()
 
-	if !ok || jsonlPath == "" || len(subscribers) == 0 {
+	// Fall back to registry (covers tmux sessions with claude running inside).
+	if jsonlPath == "" && s.registry != nil {
+		if cid, ok := s.registry.GetClaudeSessionID(session); ok {
+			if proj, ok := s.registry.GetProject(session); ok {
+				jsonlPath = claudeJSONLPath(proj, cid)
+			}
+		}
+	}
+
+	if jsonlPath == "" {
 		return
 	}
 
-	turns := parseChatHistory(jsonlPath)
+	turns, meta := parseChatHistory(jsonlPath)
 	if turns == nil {
-		turns = []ChatTurn{} // send empty array rather than null
+		turns = []ChatTurn{}
 	}
 	msg, err := json.Marshal(OutboundMessage{
 		Type: "chat_history",
 		Payload: map[string]interface{}{
-			"session": session,
-			"turns":   turns,
+			"session":      session,
+			"session_done": meta.SessionDone,
+			"is_error":     meta.IsError,
+			"cost_usd":     meta.CostUSD,
+			"duration_ms":  meta.DurationMs,
+			"num_turns":    meta.NumTurns,
+			"turns":        turns,
 		},
 	})
 	if err != nil {
@@ -2193,12 +2620,10 @@ func (s *Server) sendChatHistory(session string) {
 	}
 
 	s.mu.RLock()
-	for _, id := range subscribers {
-		if c, ok := s.clients[id]; ok {
-			select {
-			case c.send <- msg:
-			default:
-			}
+	for _, c := range s.clients {
+		select {
+		case c.send <- msg:
+		default:
 		}
 	}
 	s.mu.RUnlock()
@@ -2210,6 +2635,18 @@ func (s *Server) sendChatHistory(session string) {
 // Format: ESC ] 7 ; file://hostname/path BEL   (or ST = ESC \)
 // Emitted by modern shells (zsh, bash with vte.sh, fish) on every prompt,
 // giving us a live CWD without polling.
+// lastNLines returns the last n non-empty lines from s.
+func lastNLines(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	var result []string
+	for i := len(lines) - 1; i >= 0 && len(result) < n; i-- {
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+			result = append([]string{lines[i]}, result...)
+		}
+	}
+	return strings.Join(result, "\n")
+}
+
 func parseOSC7CWD(data []byte) string {
 	const osc7Prefix = "\x1b]7;"
 	s := string(data)

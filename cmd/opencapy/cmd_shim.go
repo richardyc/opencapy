@@ -73,6 +73,7 @@ func newShimCmd() *cobra.Command {
 				"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
 				"cols":         cols,
 				"rows":         rows,
+				"inside_tmux":  os.Getenv("TMUX") != "",
 			}); err != nil {
 				return fallbackExec(claudePath, args)
 			}
@@ -95,7 +96,7 @@ func newShimCmd() *cobra.Command {
 			}
 			defer ptmx.Close()
 
-			setTerminalTitle(fmt.Sprintf("claude · %s · running", sessionName))
+			setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
 
 			// Put terminal in raw mode if connected to a real TTY.
 			if isTerminal {
@@ -238,7 +239,7 @@ func newShimCmd() *cobra.Command {
 				}
 			}
 
-			setTerminalTitle(fmt.Sprintf("claude · %s · running", sessionName))
+			setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
 			// WS disconnected — daemon may have restarted. Reconnect, re-register,
 			// and swap activeConn so PTY data resumes flowing to the new daemon.
 			// Claude keeps running throughout; we just restore the monitoring link.
@@ -268,6 +269,7 @@ func newShimCmd() *cobra.Command {
 						"project_path": cwd,
 						"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
 						"buf":          base64.StdEncoding.EncodeToString(bufSnapshot),
+						"inside_tmux":  os.Getenv("TMUX") != "",
 					}
 					if wsjson.Write(ctx, newConn, rereg) != nil {
 						newConn.CloseNow()
@@ -360,8 +362,15 @@ func updateTitleFromEvent(sessionName string, payloadRaw json.RawMessage) {
 		setTerminalTitle(fmt.Sprintf("🔴 claude · %s · needs OK", sessionName))
 	case "done":
 		setTerminalTitle(fmt.Sprintf("✓ claude · %s · done", sessionName))
+		// Revert to idle after a brief display so the tab doesn't stay on "done" forever.
+		go func() {
+			time.Sleep(5 * time.Second)
+			setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
+		}()
 	case "crash":
 		setTerminalTitle(fmt.Sprintf("✗ claude · %s · crashed", sessionName))
+	case "idle":
+		setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
 	}
 }
 

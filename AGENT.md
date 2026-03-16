@@ -55,4 +55,6 @@ Snapshots are sent on connect and on `refresh_sessions`. Key fields:
 - `name`, `project_path`, `last_output`, `created`, `last_active`
 - `recent_events` — last 50 watcher events (approval/crash/done/running)
 - `session_type` — "tmux" or "direct"
-- `last_user_message` — last user input from JSONL transcript (direct sessions only)
+- `last_user_message` — last user input from JSONL transcript
+- `model_name`, `context_tokens`, `max_context` — model info from JSONL
+- `branch` — git branch at session launch

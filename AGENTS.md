@@ -35,6 +35,15 @@ Users run `opencapy` to create/manage tmux sessions via a bubbletea full-screen 
 - PTY uses `tmux new-session -s ocpy_<name> -t <name>` (grouped session) so iOS has independent terminal sizing without resizing the Mac client
 - `ocpy_*` sessions are internal PTY mirrors — filtered from snapshots and reconciler so they never appear in the iOS session list
 
+## Shim tmux dedup
+When the shim runs inside a tmux session (`TMUX` env set), it sends `inside_tmux: true` in `register_session` / `reregister_session`. The daemon finds the parent tmux session by cwd and sets `parentTmux` on the direct session entry. Sessions with `parentTmux` are hidden from the snapshot (no duplicate entries). The claude session ID is persisted in the registry under the tmux session name so `sendChatHistory` resolves the JSONL path for the parent.
+
+## Chat history
+`parseChatHistory` reads Claude Code's JSONL transcript (`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`) and returns `[]ChatTurn` with user text, claude text, tool count, tool names, model, stop reason, cost, and duration. `sendChatHistory` broadcasts parsed turns to all connected clients (no subscriber tracking — one-person project, 1-2 clients max).
+
+## Hook events
+`toolSummary(toolName, toolInput)` extracts a short description from PreToolUse hooks — checks `file_path`, `command`, `pattern`, `query`, `url` keys, basenames file paths, truncates to 50 chars. Emitted as event content so iOS shows "Read server.go" instead of generic "Working".
+
 ## PTY design
 - `internal/pty/pty.go` manages active PTY sessions
 - `Open(sessionName, clientID, cols, rows, startDir)`: two-step creation:
