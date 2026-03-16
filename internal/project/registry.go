@@ -5,13 +5,21 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
-// Registry maps session names to project paths (cwd at creation time).
+// SessionInfo holds persistent metadata for a session.
+type SessionInfo struct {
+	ProjectPath     string     `json:"project_path"`
+	ClaudeSessionID string     `json:"claude_session_id,omitempty"`
+	CreatedAt       *time.Time `json:"created_at,omitempty"`
+}
+
+// Registry maps session names to session metadata, persisted to disk.
 type Registry struct {
 	mu       sync.RWMutex
-	sessions map[string]string // session name -> project path
-	path     string            // path to registry file
+	sessions map[string]SessionInfo
+	path     string
 }
 
 func registryPath() string {
@@ -20,12 +28,11 @@ func registryPath() string {
 }
 
 // Load reads the registry from ~/.opencapy/sessions.json.
-// Creates the file with an empty registry if it doesn't exist.
 func Load() (*Registry, error) {
 	p := registryPath()
 
 	r := &Registry{
-		sessions: make(map[string]string),
+		sessions: make(map[string]SessionInfo),
 		path:     p,
 	}
 
@@ -37,18 +44,56 @@ func Load() (*Registry, error) {
 		return nil, err
 	}
 
+	// Tolerate empty or corrupted files — start with a fresh registry.
+	if len(data) == 0 {
+		return r, nil
+	}
 	if err := json.Unmarshal(data, &r.sessions); err != nil {
-		return nil, err
+		return r, nil
 	}
 	return r, nil
 }
 
-// Register adds a session->project mapping.
+// Register adds or updates a session's project path.
 func (r *Registry) Register(sessionName, projectPath string) error {
 	r.mu.Lock()
-	r.sessions[sessionName] = projectPath
+	info := r.sessions[sessionName]
+	info.ProjectPath = projectPath
+	r.sessions[sessionName] = info
 	r.mu.Unlock()
 	return r.Save()
+}
+
+// SetClaudeSessionID binds a Claude Code session ID to a session.
+func (r *Registry) SetClaudeSessionID(sessionName, claudeSessionID string) error {
+	r.mu.Lock()
+	info := r.sessions[sessionName]
+	info.ClaudeSessionID = claudeSessionID
+	r.sessions[sessionName] = info
+	r.mu.Unlock()
+	return r.Save()
+}
+
+// SetCreatedAt persists the creation time for a session (only if not already set).
+func (r *Registry) SetCreatedAt(sessionName string, t time.Time) {
+	r.mu.Lock()
+	info := r.sessions[sessionName]
+	if info.CreatedAt == nil {
+		info.CreatedAt = &t
+		r.sessions[sessionName] = info
+	}
+	r.mu.Unlock()
+}
+
+// GetCreatedAt returns the persisted creation time for a session.
+func (r *Registry) GetCreatedAt(sessionName string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	info, ok := r.sessions[sessionName]
+	if !ok || info.CreatedAt == nil {
+		return time.Time{}, false
+	}
+	return *info.CreatedAt, true
 }
 
 // Unregister removes a session from the registry.
@@ -63,8 +108,19 @@ func (r *Registry) Unregister(sessionName string) error {
 func (r *Registry) GetProject(sessionName string) (string, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	p, ok := r.sessions[sessionName]
-	return p, ok
+	info, ok := r.sessions[sessionName]
+	return info.ProjectPath, ok
+}
+
+// GetClaudeSessionID returns the Claude Code session ID for a session.
+func (r *Registry) GetClaudeSessionID(sessionName string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	info, ok := r.sessions[sessionName]
+	if !ok || info.ClaudeSessionID == "" {
+		return "", false
+	}
+	return info.ClaudeSessionID, true
 }
 
 // All returns a copy of all session->project mappings.
@@ -73,7 +129,7 @@ func (r *Registry) All() map[string]string {
 	defer r.mu.RUnlock()
 	out := make(map[string]string, len(r.sessions))
 	for k, v := range r.sessions {
-		out[k] = v
+		out[k] = v.ProjectPath
 	}
 	return out
 }
@@ -84,16 +140,17 @@ func (r *Registry) AllProjects() []string {
 	defer r.mu.RUnlock()
 	seen := make(map[string]bool)
 	var out []string
-	for _, path := range r.sessions {
-		if !seen[path] {
-			seen[path] = true
-			out = append(out, path)
+	for _, info := range r.sessions {
+		if !seen[info.ProjectPath] {
+			seen[info.ProjectPath] = true
+			out = append(out, info.ProjectPath)
 		}
 	}
 	return out
 }
 
-// Save writes the registry to disk.
+// Save writes the registry to disk atomically (write tmp + rename)
+// so a kill during write never corrupts the file.
 func (r *Registry) Save() error {
 	r.mu.RLock()
 	data, err := json.MarshalIndent(r.sessions, "", "  ")
@@ -107,5 +164,9 @@ func (r *Registry) Save() error {
 		return err
 	}
 
-	return os.WriteFile(r.path, data, 0o644)
+	tmp := r.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, r.path)
 }

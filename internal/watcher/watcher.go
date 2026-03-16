@@ -3,7 +3,6 @@ package watcher
 import (
 	"context"
 	"hash/fnv"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -11,18 +10,19 @@ import (
 	"github.com/richardyc/opencapy/internal/tmux"
 )
 
-// EventType classifies detected CC events.
+// EventType classifies session events.
 type EventType string
 
 const (
-	EventApproval EventType = "approval"
-	EventCrash    EventType = "crash"
-	EventDone     EventType = "done"
-	EventRunning  EventType = "running" // new task started after a done/crash
-	EventOutput   EventType = "output"  // raw pane lines for live display
+	EventApproval EventType = "approval" // Claude needs permission (from hooks)
+	EventCrash    EventType = "crash"    // session crashed (from shim exit code)
+	EventDone     EventType = "done"     // task complete (from Stop hook or JSONL)
+	EventRunning  EventType = "running"  // tool executing (from PreToolUse hook)
+	EventOutput   EventType = "output"   // raw pane lines for live display
+	EventIdle     EventType = "idle"     // waiting for input
 )
 
-// Event represents a detected CC event in a tmux pane.
+// Event represents a session event.
 type Event struct {
 	Type      EventType `json:"type"`
 	Session   string    `json:"session"`
@@ -30,46 +30,9 @@ type Event struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// structuredPatterns are used only for push notifications and the approval popup.
-// Display is handled by raw EventOutput — no more brittle pattern-matching for UI.
-var structuredPatterns = map[EventType]*regexp.Regexp{
-	EventApproval: regexp.MustCompile(`(?i)(do you want to proceed|\[y/n\]|❯\s*1\.?\s*yes)`),
-	EventCrash:    regexp.MustCompile(`(?im)^\s*(Traceback \(most recent call last\)|panic:|fatal error:|FATAL ERROR:)`),
-	EventDone:     regexp.MustCompile(`(?i)task complete`),
-}
-
-// toolCallPattern finds the ⏺ ToolName(...) line to show in approval context.
-var toolCallPattern = regexp.MustCompile(`⏺\s+\S`)
-
-// extractApprovalContext returns the last tool-call line from a wider output window.
-func extractApprovalContext(output string) string {
-	lines := strings.Split(output, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if toolCallPattern.MatchString(lines[i]) {
-			return strings.TrimSpace(lines[i])
-		}
-	}
-	return "Claude Code needs approval"
-}
-
-// DetectEvents scans pane output for structured events (approval/crash/done).
-func DetectEvents(sessionName, output string) []Event {
-	var events []Event
-	now := time.Now()
-	for eventType, pat := range structuredPatterns {
-		if match := pat.FindString(output); match != "" {
-			events = append(events, Event{
-				Type:      eventType,
-				Session:   sessionName,
-				Content:   match,
-				Timestamp: now,
-			})
-		}
-	}
-	return events
-}
-
-// Watcher polls all registered sessions and emits events.
+// Watcher polls tmux sessions for raw terminal output (live display).
+// All semantic events (approval, done, crash, running) come from Claude Code's
+// hook system and the JSONL transcript watcher — no string pattern matching.
 type Watcher struct {
 	mu        sync.RWMutex
 	sessions  map[string]string
@@ -79,7 +42,6 @@ type Watcher struct {
 	lastEvent map[string]map[EventType]time.Time
 }
 
-// New creates a new Watcher with the given poll interval.
 func New(interval time.Duration) *Watcher {
 	return &Watcher{
 		sessions:  make(map[string]string),
@@ -90,7 +52,6 @@ func New(interval time.Duration) *Watcher {
 	}
 }
 
-// HasSession returns true if the session is already registered.
 func (w *Watcher) HasSession(name string) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -98,14 +59,12 @@ func (w *Watcher) HasSession(name string) bool {
 	return ok
 }
 
-// AddSession registers a session for watching.
 func (w *Watcher) AddSession(name, projectPath string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.sessions[name] = projectPath
 }
 
-// RemoveSession unregisters a session.
 func (w *Watcher) RemoveSession(name string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -114,7 +73,6 @@ func (w *Watcher) RemoveSession(name string) {
 	delete(w.lastEvent, name)
 }
 
-// Events returns the read-only event channel.
 func (w *Watcher) Events() <-chan Event {
 	return w.events
 }
@@ -147,7 +105,6 @@ func (w *Watcher) poll() {
 			continue
 		}
 
-		// Skip if pane content unchanged.
 		h := fnv.New64a()
 		h.Write([]byte(output))
 		hash := h.Sum64()
@@ -159,7 +116,6 @@ func (w *Watcher) poll() {
 		w.lastHash[name] = hash
 		w.mu.Unlock()
 
-		// --- EventOutput: last 15 lines as a live pane snapshot, 1s cooldown ---
 		lines := strings.Split(output, "\n")
 		if len(lines) > 15 {
 			lines = lines[len(lines)-15:]
@@ -170,28 +126,11 @@ func (w *Watcher) poll() {
 			Content:   strings.Join(lines, "\n"),
 			Timestamp: time.Now(),
 		}, 1*time.Second)
-
-		// --- Structured events (approval/crash/done) for push + approval popup ---
-		// Only scan the bottom 5 lines to avoid false matches in historical output.
-		tail := strings.Join(lines[max(0, len(lines)-5):], "\n")
-		structured := DetectEvents(name, tail)
-
-		// Enrich approval with a wider context window to find the ⏺ tool call.
-		for i, ev := range structured {
-			if ev.Type == EventApproval {
-				ctx50, _ := tmux.CapturePaneOutput(name, 50, true)
-				structured[i].Content = extractApprovalContext(ctx50)
-			}
-		}
-		for _, ev := range structured {
-			w.tryEmit(name, ev, 2*time.Second)
-		}
 	}
 }
 
-// Emit sends an event directly to the broadcast channel, bypassing cooldown.
-// Used by the hooks endpoint to emit precise semantic events (approval, done, crash)
-// that come from Claude Code's hook system rather than string matching.
+// Emit sends an event directly, bypassing cooldown.
+// Used by hooks and the JSONL watcher for precise semantic events.
 func (w *Watcher) Emit(ev Event) {
 	select {
 	case w.events <- ev:
@@ -199,8 +138,7 @@ func (w *Watcher) Emit(ev Event) {
 	}
 }
 
-// FeedOutput emits only an EventOutput for a direct session.
-// Detection (approval/crash/done) is handled by the hooks endpoint.
+// FeedOutput emits raw terminal output for a direct session.
 func (w *Watcher) FeedOutput(sessionName, output string) {
 	if output == "" {
 		return
@@ -217,7 +155,6 @@ func (w *Watcher) FeedOutput(sessionName, output string) {
 	}, 1*time.Second)
 }
 
-// tryEmit fires ev if the per-(session,type) cooldown has elapsed.
 func (w *Watcher) tryEmit(session string, ev Event, cooldown time.Duration) {
 	w.mu.Lock()
 	if w.lastEvent[session] == nil {
@@ -233,11 +170,4 @@ func (w *Watcher) tryEmit(session string, ev Event, cooldown time.Duration) {
 	case w.events <- ev:
 	default:
 	}
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
