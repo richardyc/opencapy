@@ -1991,17 +1991,37 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return // already in a stop hook loop, skip
 		}
-		lastMsg, _ := payload["last_assistant_message"].(string)
-		s.sessionWatch.Emit(watcher.Event{
-			Type:      watcher.EventDone,
-			Session:   sessionName,
-			Content:   lastMsg,
-			Timestamp: time.Now(),
-		})
+		// stop_reason=="tool_use" means Claude responded with tool calls and is
+		// about to execute them — not actually done. Only emit EventDone when the
+		// turn truly ends (end_turn, max_tokens, etc.) so the title doesn't flash
+		// "idle" between tool calls during extended-thinking / agentic runs.
+		stopReason, _ := payload["stop_reason"].(string)
+		if stopReason != "tool_use" {
+			lastMsg, _ := payload["last_assistant_message"].(string)
+			s.sessionWatch.Emit(watcher.Event{
+				Type:      watcher.EventDone,
+				Session:   sessionName,
+				Content:   lastMsg,
+				Timestamp: time.Now(),
+			})
+		}
 		// Re-read transcript now that the turn is complete and push to iOS.
 		go s.sendChatHistory(sessionName)
 		w.WriteHeader(http.StatusOK)
 	case "PreToolUse":
+		toolName, _ := payload["tool_name"].(string)
+		detail := toolSummary(toolName, payload["tool_input"])
+		s.sessionWatch.Emit(watcher.Event{
+			Type:      watcher.EventRunning,
+			Session:   sessionName,
+			Content:   detail,
+			Timestamp: time.Now(),
+		})
+		w.WriteHeader(http.StatusOK)
+	case "PostToolUse":
+		// Claude is processing tool results and generating the next response.
+		// Emit EventRunning so the title stays "running" during extended thinking
+		// between tool calls, not just during tool execution itself.
 		toolName, _ := payload["tool_name"].(string)
 		detail := toolSummary(toolName, payload["tool_input"])
 		s.sessionWatch.Emit(watcher.Event{
