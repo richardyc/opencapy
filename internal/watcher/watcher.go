@@ -17,9 +17,8 @@ const (
 	EventApproval EventType = "approval" // Claude needs permission (from hooks)
 	EventCrash    EventType = "crash"    // session crashed (from shim exit code)
 	EventDone     EventType = "done"     // task complete (from Stop hook or JSONL)
-	EventRunning  EventType = "running"  // tool executing (from PreToolUse hook)
+	EventRunning  EventType = "running"  // tool executing (from PreToolUse/PostToolUse hooks)
 	EventOutput   EventType = "output"   // raw pane lines for live display
-	EventIdle     EventType = "idle"     // waiting for input
 )
 
 // Event represents a session event.
