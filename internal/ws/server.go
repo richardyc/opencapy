@@ -120,15 +120,12 @@ type Server struct {
 	// The PermissionRequest hook handler blocks on this channel until iOS responds.
 	pendingApprovals   map[string]chan bool
 	pendingApprovalsMu sync.Mutex
-	// lastLiveActivityPush tracks when we last sent a Live Activity APNs push per session.
-	// Used to throttle output-driven updates so we don't spam APNs during idle periods.
-	lastLiveActivityPush   map[string]time.Time
-	lastLiveActivityPushMu sync.Mutex
 }
 
 type liveActivityEntry struct {
 	token       string
 	machineName string
+	lastPush    time.Time // throttle output-driven Live Activity updates
 }
 
 // directSessionState tracks a session spawned by the claude shim (no tmux involved).
@@ -200,8 +197,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		liveActivityTokens: make(map[string]liveActivityEntry),
 		clientDeviceNames:  make(map[string]string),
 		directSessions:     make(map[string]*directSessionState),
-		pendingApprovals:       make(map[string]chan bool),
-		lastLiveActivityPush:   make(map[string]time.Time),
+		pendingApprovals: make(map[string]chan bool),
 	}
 }
 
@@ -1535,22 +1531,21 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 						}
 					}
 					if state != nil {
-						s.lastLiveActivityPushMu.Lock()
-						s.lastLiveActivityPush[ev.Session] = time.Now()
-						s.lastLiveActivityPushMu.Unlock()
+						s.liveActivityTokensMu.Lock()
+						entry.lastPush = time.Now()
+						s.liveActivityTokens[ev.Session] = entry
+						s.liveActivityTokensMu.Unlock()
 						go s.push.SendLiveActivity(entry.token, *state)
-					}
-
-					// Throttled output update: during extended thinking there are no
-					// hook events so the Live Activity freezes. Send a low-frequency
-					// update when raw output arrives and it's been >15s since last push.
-					if ev.Type == watcher.EventOutput {
-						s.lastLiveActivityPushMu.Lock()
-						due := time.Since(s.lastLiveActivityPush[ev.Session]) > 15*time.Second
+					} else if ev.Type == watcher.EventOutput {
+						// Throttle: during extended thinking no hooks fire, so send a
+						// low-frequency output update if >15s has passed since last push.
+						s.liveActivityTokensMu.Lock()
+						due := time.Since(entry.lastPush) > 15*time.Second
 						if due {
-							s.lastLiveActivityPush[ev.Session] = time.Now()
+							entry.lastPush = time.Now()
+							s.liveActivityTokens[ev.Session] = entry
 						}
-						s.lastLiveActivityPushMu.Unlock()
+						s.liveActivityTokensMu.Unlock()
 						if due {
 							go s.push.SendLiveActivity(entry.token, push.LiveActivityContentState{
 								SessionName: ev.Session,
