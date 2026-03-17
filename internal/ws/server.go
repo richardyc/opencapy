@@ -219,6 +219,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/pair", s.handlePair)
 	mux.HandleFunc("/hooks/claude", s.handleClaudeHook)
 	mux.HandleFunc("/approve", s.handleHTTPApprove)
+	mux.HandleFunc("/unlink", s.handleUnlink)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.port),
@@ -331,6 +332,33 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 			"type": "tailscale",
 		})
 	}
+}
+
+// handleUnlink broadcasts machine_unlinked to all iOS clients, then wipes the relay
+// token and push device registry so a fresh QR scan is required to re-pair.
+func (s *Server) handleUnlink(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Notify all connected iOS clients before invalidating credentials.
+	data, _ := json.Marshal(OutboundMessage{Type: "machine_unlinked"})
+	s.mu.RLock()
+	for _, c := range s.clients {
+		select {
+		case c.send <- data:
+		default:
+		}
+	}
+	s.mu.RUnlock()
+
+	// Delete relay token (regenerated on next daemon start) and push registry.
+	home, _ := os.UserHomeDir()
+	os.Remove(filepath.Join(home, ".opencapy", "relay_token.json"))
+	os.Remove(filepath.Join(home, ".opencapy", "devices.json"))
+
+	log.Println("[unlink] relay token and device registry cleared")
+	w.WriteHeader(http.StatusOK)
 }
 
 // isPathAllowed checks whether path falls within one of the registered project paths,
@@ -687,6 +715,12 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Token != "" && s.push != nil {
 			_ = s.push.Register(msg.Token, client.ID)
 			log.Printf("Device registered for push: %s", client.ID)
+		}
+
+	case "unregister_device":
+		if msg.Token != "" && s.push != nil {
+			s.push.Unregister(msg.Token)
+			log.Printf("Device unregistered: %s", client.ID)
 		}
 
 	case "register_device":

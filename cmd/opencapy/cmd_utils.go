@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -394,6 +395,28 @@ func patchVSCodeTabTitle() {
 		fmt.Println()
 		fmt.Println("VS Code/Cursor: add to settings.json for accurate tab titles:")
 		fmt.Printf(`  "%s": "%s"`+"\n", key, val)
+	}
+}
+
+func newUnlinkCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "unlink",
+		Short: "Revoke all iOS pairings (broadcasts to connected devices, resets relay token)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, _ := config.Load()
+			port := 7242
+			if cfg != nil {
+				port = cfg.Port
+			}
+			resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/unlink", port), "", nil)
+			if err != nil {
+				return fmt.Errorf("daemon not running — start it first with: opencapy daemon")
+			}
+			resp.Body.Close()
+			fmt.Println("✓ All iOS devices unlinked")
+			fmt.Println("  Run: opencapy qr   # to re-pair your iPhone")
+			return nil
+		},
 	}
 }
 
