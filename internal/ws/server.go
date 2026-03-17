@@ -1908,9 +1908,14 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 	claudeSessionID, _ := payload["session_id"].(string)
 
 	// Session name comes from the OPENCAPY_SESSION env var, passed as ?session= query param.
+	// If missing (claude run directly without the shim, e.g. inside a tmux session whose
+	// shell hasn't sourced the opencapy init yet), fall back to matching by CWD.
 	sessionName := r.URL.Query().Get("session")
+	if sessionName == "" && cwd != "" {
+		sessionName = s.findTmuxSessionByCwd(cwd)
+	}
 	if sessionName == "" {
-		log.Printf("[hook] %s: no session in query param (cwd=%q)", hookName, cwd)
+		log.Printf("[hook] %s: no session for cwd=%q", hookName, cwd)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
