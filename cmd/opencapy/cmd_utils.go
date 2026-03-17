@@ -203,10 +203,7 @@ func selfUpdate() error {
 	}
 	newBin := filepath.Join(tmp, "opencapy")
 	if err := exec.Command("cp", newBin, dest).Run(); err != nil {
-		// Retry with sudo if permission denied.
-		if err2 := exec.Command("sudo", "cp", newBin, dest).Run(); err2 != nil {
-			return fmt.Errorf("install binary (try running with sudo): %w", err)
-		}
+		return fmt.Errorf("cannot replace %s: %w\n  re-run with: sudo opencapy update", dest, err)
 	}
 	fmt.Printf("✓ Updated to %s\n", release.TagName)
 	return nil
