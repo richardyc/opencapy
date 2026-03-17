@@ -149,15 +149,28 @@ Type=simple
 ExecStart={{.BinaryPath}} daemon
 Restart=always
 RestartSec=5
+Environment=HOME={{.HomeDir}}
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 `
 
-// InstallSystemd writes the unit file and enables it.
+// InstallSystemd writes a user-level systemd unit file and enables + starts it.
+// Using the user instance (systemctl --user) means no sudo is required and the
+// service runs with the correct HOME / environment for the calling user.
 func InstallSystemd(binaryPath string) error {
-	unitPath := "/etc/systemd/system/opencapy.service"
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("get home dir: %w", err)
+	}
 
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		return fmt.Errorf("create systemd user dir: %w", err)
+	}
+
+	unitPath := filepath.Join(unitDir, "opencapy.service")
 	f, err := os.Create(unitPath)
 	if err != nil {
 		return fmt.Errorf("create unit file: %w", err)
@@ -165,15 +178,29 @@ func InstallSystemd(binaryPath string) error {
 	defer f.Close()
 
 	tmpl := template.Must(template.New("systemd").Parse(systemdTemplate))
-	if err := tmpl.Execute(f, struct{ BinaryPath string }{binaryPath}); err != nil {
+	if err := tmpl.Execute(f, struct{ BinaryPath, HomeDir string }{binaryPath, home}); err != nil {
 		return fmt.Errorf("write unit file: %w", err)
 	}
 
-	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+	if err := exec.Command("systemctl", "--user", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("daemon-reload: %w", err)
 	}
 
-	cmd := exec.Command("systemctl", "enable", "opencapy")
+	// enable + start in one step so the daemon is live immediately.
+	cmd := exec.Command("systemctl", "--user", "enable", "--now", "opencapy")
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	// Allow the service to survive when the user's login session ends
+	// (e.g. SSH disconnect). Ignore errors — loginctl may not be available.
+	exec.Command("loginctl", "enable-linger").Run() //nolint:errcheck
+	return nil
+}
+
+// SystemdUnitPath returns the path to the user-level opencapy systemd unit file.
+func SystemdUnitPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "systemd", "user", "opencapy.service")
 }

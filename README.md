@@ -17,10 +17,13 @@ opencapy install   # installs LaunchAgent, auto-starts daemon at login
 ```bash
 curl -fsSL https://github.com/richardyc/opencapy/releases/latest/download/opencapy_linux_amd64.tar.gz | tar xz
 sudo mv opencapy /usr/local/bin/
-sudo opencapy install   # installs systemd service
+opencapy install        # installs user systemd service, starts daemon, injects shell hook
+source ~/.bashrc        # or open a new terminal
 ```
 
 > Swap `amd64` for `arm64` if needed. Check with `uname -m` (`x86_64` = amd64, `aarch64` = arm64).
+>
+> The daemon runs as a **user systemd service** (`~/.config/systemd/user/`) — no `sudo` required after the binary is in place.
 
 ## Quick start
 

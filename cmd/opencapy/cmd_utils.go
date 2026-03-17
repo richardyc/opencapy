@@ -134,8 +134,8 @@ func newUpdateCmd() *cobra.Command {
 			}
 
 			if platform.IsLinux() {
-				if err := exec.Command("sudo", "systemctl", "restart", "opencapy").Run(); err != nil {
-					return fmt.Errorf("systemctl restart: %w", err)
+				if err := exec.Command("systemctl", "--user", "restart", "opencapy").Run(); err != nil {
+					return fmt.Errorf("systemctl --user restart: %w", err)
 				}
 				return verifyDaemon()
 			}
@@ -282,8 +282,7 @@ func newInstallCmd() *cobra.Command {
 				if err := platform.InstallSystemd(binaryPath); err != nil {
 					return fmt.Errorf("install systemd: %w", err)
 				}
-				fmt.Println("✓ Daemon installed (systemd)")
-				fmt.Println("  Start now: sudo systemctl start opencapy")
+				fmt.Println("✓ Daemon installed and started (systemd --user)")
 			} else {
 				return fmt.Errorf("unsupported platform")
 			}
@@ -379,11 +378,20 @@ func newUninstallCmd() *cobra.Command {
 				os.Remove(plistPath)
 				fmt.Println("✓ LaunchAgent removed")
 			}
-			unitPath := "/etc/systemd/system/opencapy.service"
-			if _, err := os.Stat(unitPath); err == nil {
+			// Remove user systemd service (current install method).
+			userUnitPath := platform.SystemdUnitPath()
+			if _, err := os.Stat(userUnitPath); err == nil {
+				exec.Command("systemctl", "--user", "disable", "--now", "opencapy").Run() //nolint:errcheck
+				os.Remove(userUnitPath)
+				exec.Command("systemctl", "--user", "daemon-reload").Run() //nolint:errcheck
+				fmt.Println("✓ systemd user service removed")
+			}
+			// Also clean up legacy system-level service if present.
+			sysUnitPath := "/etc/systemd/system/opencapy.service"
+			if _, err := os.Stat(sysUnitPath); err == nil {
 				exec.Command("sudo", "systemctl", "disable", "--now", "opencapy").Run() //nolint:errcheck
-				os.Remove(unitPath)
-				fmt.Println("✓ systemd service removed")
+				os.Remove(sysUnitPath)
+				fmt.Println("✓ systemd system service removed")
 			}
 
 			// Kill any running daemon.
