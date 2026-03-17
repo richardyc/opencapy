@@ -2070,6 +2070,14 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 		// Re-read transcript now that the turn is complete and push to iOS.
 		go s.sendChatHistory(sessionName)
 		w.WriteHeader(http.StatusOK)
+	case "UserPromptSubmit":
+		s.sessionWatch.Emit(watcher.Event{
+			Type:      watcher.EventRunning,
+			Session:   sessionName,
+			Content:   "thinking…",
+			Timestamp: time.Now(),
+		})
+		w.WriteHeader(http.StatusOK)
 	case "PreToolUse":
 		toolName, _ := payload["tool_name"].(string)
 		detail := toolSummary(toolName, payload["tool_input"])

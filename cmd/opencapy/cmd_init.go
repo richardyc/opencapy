@@ -215,7 +215,7 @@ func injectClaudeHooks() {
 		},
 	}
 
-	for _, event := range []string{"SessionStart", "Stop", "PostToolUse"} {
+	for _, event := range []string{"SessionStart", "Stop", "PreToolUse", "PostToolUse", "UserPromptSubmit"} {
 		existing, _ := hooks[event].([]interface{})
 		hooks[event] = append(existing, asyncHook)
 	}
