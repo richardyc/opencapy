@@ -1455,7 +1455,6 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 			}
 
 			s.mu.RLock()
-			clientCount := len(s.clients)
 			for _, client := range s.clients {
 				select {
 				case client.send <- data:
@@ -1465,22 +1464,13 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 			}
 			s.mu.RUnlock()
 
-			// Push notifications when no iOS clients are connected.
-			if s.push != nil && clientCount == 0 {
+			// Push notifications — always sent via APNs so they arrive on the lock
+			// screen regardless of WS connection state. The iOS app suppresses the
+			// banner in-app when the user is actively watching the session.
+			if s.push != nil {
 				switch ev.Type {
 				case watcher.EventApproval:
-					s.push.Send(push.Payload{
-						Aps: push.ApsPayload{
-							Alert: push.AlertPayload{
-								Title: "Approval needed",
-								Body:  fmt.Sprintf("[%s] Claude Code needs your input", ev.Session),
-							},
-							Sound:    "default",
-							Category: "APPROVAL",
-						},
-						Session: ev.Session,
-						Event:   string(ev.Type),
-					})
+					s.push.Send(push.ApprovalPayload(ev.Session))
 				case watcher.EventCrash:
 					s.push.Send(push.CrashPayload(ev.Session, ev.Content))
 				case watcher.EventDone:
@@ -1488,8 +1478,8 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 				}
 			}
 
-			// Live Activity push — sent for key events regardless of WS client count
-			// so the lock screen Live Activity updates even when the app is backgrounded.
+			// Live Activity push — always sent via APNs push token so the lock
+			// screen widget updates even when the app is backgrounded.
 			if s.push != nil {
 				s.liveActivityTokensMu.RLock()
 				entry, hasToken := s.liveActivityTokens[ev.Session]

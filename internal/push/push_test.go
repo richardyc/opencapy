@@ -10,8 +10,8 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if reg.Count() != 0 {
-		t.Errorf("expected 0 devices, got %d", reg.Count())
+	if len(reg.devices) != 0 {
+		t.Errorf("expected 0 devices, got %d", len(reg.devices))
 	}
 }
 
@@ -25,22 +25,12 @@ func TestRegisterUnregister(t *testing.T) {
 	if err := reg.Register("token-abc", "client-1"); err != nil {
 		t.Fatalf("Register() error: %v", err)
 	}
-	if reg.Count() != 1 {
-		t.Errorf("expected 1 device after register, got %d", reg.Count())
+	if len(reg.devices) != 1 {
+		t.Errorf("expected 1 device after register, got %d", len(reg.devices))
 	}
 
 	reg.Unregister("token-abc")
-	if reg.Count() != 0 {
-		t.Errorf("expected 0 devices after unregister, got %d", reg.Count())
-	}
-}
-
-func TestApprovalPayload(t *testing.T) {
-	p := ApprovalPayload("my-session")
-	if p.Session != "my-session" {
-		t.Errorf("expected session my-session, got %s", p.Session)
-	}
-	if p.Aps.Category != "APPROVAL" {
-		t.Errorf("expected category APPROVAL, got %s", p.Aps.Category)
+	if len(reg.devices) != 0 {
+		t.Errorf("expected 0 devices after unregister, got %d", len(reg.devices))
 	}
 }

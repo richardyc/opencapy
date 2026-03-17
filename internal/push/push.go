@@ -210,24 +210,6 @@ func (r *Registry) Send(payload Payload) {
 	log.Printf("[push stub] would send to %d devices:\n%s", len(r.devices), string(data))
 }
 
-// Devices returns all registered device tokens.
-func (r *Registry) Devices() []DeviceToken {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	list := make([]DeviceToken, 0, len(r.devices))
-	for _, dt := range r.devices {
-		list = append(list, dt)
-	}
-	return list
-}
-
-// Count returns number of registered devices.
-func (r *Registry) Count() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.devices)
-}
 
 // ApprovalPayload builds an approval push payload.
 func ApprovalPayload(session string) Payload {
