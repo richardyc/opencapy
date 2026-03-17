@@ -120,6 +120,10 @@ type Server struct {
 	// The PermissionRequest hook handler blocks on this channel until iOS responds.
 	pendingApprovals   map[string]chan bool
 	pendingApprovalsMu sync.Mutex
+	// lastLiveActivityPush tracks when we last sent a Live Activity APNs push per session.
+	// Used to throttle output-driven updates so we don't spam APNs during idle periods.
+	lastLiveActivityPush   map[string]time.Time
+	lastLiveActivityPushMu sync.Mutex
 }
 
 type liveActivityEntry struct {
@@ -196,7 +200,8 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		liveActivityTokens: make(map[string]liveActivityEntry),
 		clientDeviceNames:  make(map[string]string),
 		directSessions:     make(map[string]*directSessionState),
-		pendingApprovals:   make(map[string]chan bool),
+		pendingApprovals:       make(map[string]chan bool),
+		lastLiveActivityPush:   make(map[string]time.Time),
 	}
 }
 
@@ -1530,7 +1535,30 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 						}
 					}
 					if state != nil {
+						s.lastLiveActivityPushMu.Lock()
+						s.lastLiveActivityPush[ev.Session] = time.Now()
+						s.lastLiveActivityPushMu.Unlock()
 						go s.push.SendLiveActivity(entry.token, *state)
+					}
+
+					// Throttled output update: during extended thinking there are no
+					// hook events so the Live Activity freezes. Send a low-frequency
+					// update when raw output arrives and it's been >15s since last push.
+					if ev.Type == watcher.EventOutput {
+						s.lastLiveActivityPushMu.Lock()
+						due := time.Since(s.lastLiveActivityPush[ev.Session]) > 15*time.Second
+						if due {
+							s.lastLiveActivityPush[ev.Session] = time.Now()
+						}
+						s.lastLiveActivityPushMu.Unlock()
+						if due {
+							go s.push.SendLiveActivity(entry.token, push.LiveActivityContentState{
+								SessionName: ev.Session,
+								MachineName: entry.machineName,
+								Status:      "running",
+								LastOutput:  ev.Content,
+							})
+						}
 					}
 				}
 			}
