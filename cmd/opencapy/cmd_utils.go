@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -171,12 +172,7 @@ func selfUpdate() error {
 		return fmt.Errorf("parse release info: %w", err)
 	}
 
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
-	if goarch == "amd64" {
-		goarch = "amd64"
-	}
-	tarball := fmt.Sprintf("opencapy_%s_%s.tar.gz", goos, goarch)
+	tarball := fmt.Sprintf("opencapy_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
 	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, release.TagName, tarball)
 
 	fmt.Printf("Downloading %s…\n", release.TagName)
@@ -196,17 +192,52 @@ func selfUpdate() error {
 		return fmt.Errorf("extract: %w", err)
 	}
 
-	// Replace the running binary.
+	// Replace the running binary using Go's own I/O — avoids cross-filesystem
+	// cp failures and doesn't require cp to be in PATH.
 	dest, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	// Resolve symlinks so we write to the real file (e.g. Homebrew Cellar path).
+	if resolved, err := filepath.EvalSymlinks(dest); err == nil {
+		dest = resolved
+	}
 	newBin := filepath.Join(tmp, "opencapy")
-	if err := exec.Command("cp", newBin, dest).Run(); err != nil {
+	if err := replaceFile(newBin, dest); err != nil {
 		return fmt.Errorf("cannot replace %s: %w\n  re-run with: sudo opencapy update", dest, err)
 	}
 	fmt.Printf("✓ Updated to %s\n", release.TagName)
 	return nil
+}
+
+// replaceFile atomically replaces dest with src. Writes to a temp file beside
+// dest first, then renames — ensuring the old binary is never half-overwritten.
+func replaceFile(src, dest string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	// Write new binary next to dest so rename is atomic (same filesystem).
+	tmp, err := os.CreateTemp(filepath.Dir(dest), ".opencapy-update-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // cleaned up on failure; no-op after rename
+
+	if _, err := io.Copy(tmp, in); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	return os.Rename(tmpPath, dest)
 }
 
 // killAndWait kills all running opencapy daemon processes and blocks until the
