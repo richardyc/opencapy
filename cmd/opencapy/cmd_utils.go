@@ -135,9 +135,14 @@ func newUpdateCmd() *cobra.Command {
 			}
 
 			if platform.IsLinux() {
-				if err := exec.Command("systemctl", "--user", "restart", "opencapy").Run(); err != nil {
-					return fmt.Errorf("systemctl --user restart: %w", err)
+				// Kill the daemon — systemd's Restart=always brings it back with the new binary.
+				// Avoids needing to invoke systemctl --user from a potentially wrong user context.
+				cfg, _ := config.Load()
+				port := 7242
+				if cfg != nil {
+					port = cfg.Port
 				}
+				killAndWait(port)
 				return verifyDaemon()
 			}
 
