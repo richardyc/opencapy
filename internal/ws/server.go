@@ -2673,6 +2673,13 @@ func (s *Server) sendChatHistory(session string) {
 		}
 	}
 
+	// Last resort: scan the project directory for the most recently modified JSONL.
+	// Handles sessions from before the current daemon start where the registry has no entry.
+	if jsonlPath == "" {
+		if proj, ok := s.registry.GetProject(session); ok {
+			jsonlPath = discoverJSONLPath(proj)
+		}
+	}
 	if jsonlPath == "" {
 		return
 	}
