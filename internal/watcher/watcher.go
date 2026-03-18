@@ -17,6 +17,8 @@ const (
 	EventApproval EventType = "approval" // Claude needs permission (from hooks)
 	EventCrash    EventType = "crash"    // session crashed (from shim exit code)
 	EventDone     EventType = "done"     // task complete (from Stop hook or JSONL)
+	EventInput    EventType = "input"    // user message sent via chat (from chat_send)
+	EventQuestion EventType = "question" // AskUserQuestion from Claude (structured Q&A)
 	EventRunning  EventType = "running"  // tool executing (from PreToolUse/PostToolUse hooks)
 	EventOutput   EventType = "output"   // raw pane lines for live display
 )

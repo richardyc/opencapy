@@ -52,6 +52,7 @@ Download on the App Store or TestFlight. Source: [richardyc/opencapy-ios](https:
 - File browser and editor — browse, view diffs, and edit files directly
 - Git source control — stage/unstage, commit, view diffs
 - Event timeline — approval prompts, task completion, crashes
+- Chat mode — Cursor-style conversation view with message bubbles, tool summaries, thinking indicator
 - Voice input — on-device speech recognition, no API key needed
 - Push notifications and lock screen Live Activities when app is backgrounded
 - Session list with tinted glass cards, last user message preview, model name display
@@ -103,8 +104,9 @@ opencapy version            # print version + build info
 5. For approval events, the daemon scans a wider 50-line window to extract the `⏺ ToolName(...)` context shown in the iOS prompt card
 6. PTY creation is two-step: first `tmux new-session -d` (detached, synchronous) to create the grouped session and apply styling (`status-style bg=#7B5B3A,fg=#F5E6D3`) and disable mouse (`set-option mouse off`), then `attach-session` opens the PTY. Mouse is explicitly disabled on the grouped session to prevent tmux from emitting mouse-tracking escape sequences that would intercept iOS UIScrollView pan gestures in SwiftTerm
 7. Native image paste: iOS sends PNG bytes → daemon writes to `/tmp`, sets Mac clipboard via `osascript`, sends `C-v` to the tmux session → Claude Code pastes the image inline
-8. For direct sessions (claude shim), the daemon reads Claude Code's JSONL transcript to provide chat history and last user message previews in the session list
-9. When the iOS app is backgrounded, push notifications are delivered via APNs
+8. For direct sessions (claude shim), the daemon reads Claude Code's JSONL transcript to provide chat history and last user message previews in the session list. Orphan turns (user messages with no Claude response from interrupts) are filtered out
+9. Chat messages sent from iOS are injected via the shim PTY (direct sessions) or tmux send-keys, both using the Escape+Enter submit sequence
+10. When the iOS app is backgrounded, push notifications are delivered via APNs
 
 ## iOS connectivity
 
@@ -154,6 +156,9 @@ The daemon exposes a WebSocket server on port 7242.
 | `pty_input` | Send bytes to PTY (base64) |
 | `pty_resize` | Resize PTY (cols/rows) |
 | `close_pty` | Close PTY |
+| `chat_send` | Send chat message to session (text injected via shim or tmux; Escape+Enter submitted) |
+| `chat_send_image` | Send PNG image (base64) to session (sets clipboard, Ctrl+V paste) |
+| `answer_question` | Answer an AskUserQuestion prompt (session, answers map) |
 | `request_chat_history` | Request parsed JSONL transcript for a direct session |
 | `register_live_activity` | Register per-activity APNs push token for a session (fields: session, token, machine) |
 | `ping` | Heartbeat (30s interval) |

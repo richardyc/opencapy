@@ -35,11 +35,26 @@ Users run `opencapy` to create/manage tmux sessions via a bubbletea full-screen 
 - PTY uses `tmux new-session -s ocpy_<name> -t <name>` (grouped session) so iOS has independent terminal sizing without resizing the Mac client
 - `ocpy_*` sessions are internal PTY mirrors — filtered from snapshots and reconciler so they never appear in the iOS session list
 
-## Shim tmux dedup
+## Shim
+The shim (`cmd/opencapy/cmd_shim.go`) is a PTY wrapper around Claude Code that connects back to the daemon via WebSocket. It handles:
+- `pty_input` — raw keystroke injection
+- `pty_resize` — terminal resize
+- `inject_message` — writes chat text to the PTY (used by `chat_send` for direct sessions)
+- `inject_image` — sends Ctrl+V to paste clipboard content (used by `chat_send_image`)
+- `event` — title updates from daemon events
+
+### Shim tmux dedup
 When the shim runs inside a tmux session (`TMUX` env set), it sends `inside_tmux: true` in `register_session` / `reregister_session`. The daemon finds the parent tmux session by cwd and sets `parentTmux` on the direct session entry. Sessions with `parentTmux` are hidden from the snapshot (no duplicate entries). The claude session ID is persisted in the registry under the tmux session name so `sendChatHistory` resolves the JSONL path for the parent.
 
 ## Chat history
 `parseChatHistory` reads Claude Code's JSONL transcript (`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`) and returns `[]ChatTurn` with user text, claude text, tool count, tool names, model, stop reason, cost, and duration. `sendChatHistory` broadcasts parsed turns to all connected clients (no subscriber tracking — one-person project, 1-2 clients max).
+
+**Orphan turn filter:** After parsing, turns with no Claude response (`ClaudeText == ""` and `ToolCount == 0`) are dropped — except the last turn (might be in-progress). These orphan turns come from user interrupts (`[Request interrupted by user]`) or abandoned messages. Purely structural check, no string matching.
+
+## Chat send (`handleChatSend` / `handleChatSendImage`)
+- `chat_send`: injects user text into the Claude Code PTY. For direct sessions, sends `inject_message` to the shim + Escape+Enter submit via `pty_input` (300ms + 100ms delays). For tmux sessions, uses `tmux send-keys` + Escape+Enter.
+- `chat_send_image`: writes PNG to `/tmp`, sets Mac clipboard via `osascript`, sends Ctrl+V via `pty_input` (same flow as `paste_image`).
+- `answer_question`: sends structured answers for `AskUserQuestion` prompts via `pendingAnswers` channel.
 
 ## Hook events
 `toolSummary(toolName, toolInput)` extracts a short description from PreToolUse hooks — checks `file_path`, `command`, `pattern`, `query`, `url` keys, basenames file paths, truncates to 50 chars. Emitted as event content so iOS shows "Read server.go" instead of generic "Working".
@@ -112,6 +127,9 @@ Relevant protocol messages this daemon must support:
 - `file_write` `{path, content: base64}` — write arbitrary bytes
 - `file_write_ack` `{path, ok}` — write confirmation
 - `send_keys` / `approve` / `deny` / `capture_pane` / `list_dir` / `file_read` — existing ops
+- `chat_send` `{session, chat_content}` — inject chat message via shim/tmux + Escape+Enter submit
+- `chat_send_image` `{session, chat_image_b64}` — clipboard paste image into Claude Code
+- `answer_question` `{session, answers}` — structured AskUserQuestion response
 - `register_live_activity` `{session, token, machine}` — store per-activity APNs token for live activity updates
 - `git_status` `{session}` → `git_status_result {session, branch, ahead, behind, files[], ok}`
 - `git_stage` / `git_unstage` / `git_commit` / `git_diff` — git operations

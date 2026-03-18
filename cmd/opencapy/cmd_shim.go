@@ -207,7 +207,7 @@ func newShimCmd() *cobra.Command {
 			}()
 			defer signal.Stop(winchCh)
 
-			// WS → route pty_input and pty_resize from iOS to the PTY
+			// WS → route pty_input, pty_resize, inject_message, inject_image from daemon to the PTY
 			for {
 				var raw map[string]json.RawMessage
 				if err := wsjson.Read(ctx, conn, &raw); err != nil {
@@ -234,6 +234,16 @@ func newShimCmd() *cobra.Command {
 							Rows: uint16(payload.Rows),
 						})
 					}
+				case "inject_message":
+					var payload struct {
+						Content string `json:"content"`
+					}
+					if err := json.Unmarshal(raw["payload"], &payload); err == nil && payload.Content != "" {
+						handleInjectMessage(ptmx, payload.Content)
+					}
+				case "inject_image":
+					// Ctrl+V to paste clipboard content (image set by daemon).
+					ptmx.Write([]byte{0x16}) //nolint:errcheck
 				case "event":
 					updateTitleFromEvent(sessionName, raw["payload"])
 				}
@@ -283,7 +293,7 @@ func newShimCmd() *cobra.Command {
 					if old != nil {
 						old.CloseNow()
 					}
-					// Handle pty_input, pty_resize, and events from the new connection.
+					// Handle pty_input, pty_resize, inject_message, inject_image, and events from the new connection.
 					for {
 						var raw map[string]json.RawMessage
 						if wsjson.Read(ctx, newConn, &raw) != nil {
@@ -310,6 +320,15 @@ func newShimCmd() *cobra.Command {
 									Rows: uint16(payload.Rows),
 								})
 							}
+						case "inject_message":
+							var payload struct {
+								Content string `json:"content"`
+							}
+							if err := json.Unmarshal(raw["payload"], &payload); err == nil && payload.Content != "" {
+								handleInjectMessage(ptmx, payload.Content)
+							}
+						case "inject_image":
+							ptmx.Write([]byte{0x16}) //nolint:errcheck
 						case "event":
 							updateTitleFromEvent(sessionName, raw["payload"])
 						}
@@ -405,6 +424,17 @@ func findRealClaude() (string, error) {
 // Used when the daemon is unavailable — completely transparent to the user.
 func fallbackExec(claudePath string, args []string) error {
 	return syscall.Exec(claudePath, append([]string{claudePath}, args...), os.Environ())
+}
+
+// handleInjectMessage writes a chat message to the PTY using bracket paste mode.
+// Bracket paste (\x1b[200~...\x1b[201~) tells Claude Code's Ink UI that content
+// is pasted, suppressing autocomplete — so no ESC is needed before Enter.
+func handleInjectMessage(ptmx *os.File, content string) {
+	ptmx.Write([]byte("\x1b[200~")) //nolint:errcheck
+	ptmx.Write([]byte(content))     //nolint:errcheck
+	ptmx.Write([]byte("\x1b[201~")) //nolint:errcheck
+	time.Sleep(50 * time.Millisecond)
+	ptmx.Write([]byte{0x0D}) //nolint:errcheck // Enter (submit)
 }
 
 // unquote strips surrounding JSON quotes from a raw JSON string value.

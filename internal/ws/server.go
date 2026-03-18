@@ -59,6 +59,10 @@ type InboundMessage struct {
 	Mode        string `json:"mode,omitempty"`         // "chat" or "terminal"
 	ProjectPath string `json:"project_path,omitempty"` // working directory for new session
 	LaunchMode  string `json:"launch_mode,omitempty"`  // "terminal", "claude", "claude_skip"
+	// Chat mode (shim-based message injection)
+	ChatContent  string            `json:"chat_content,omitempty"`   // text for chat_send
+	ChatImageB64 string            `json:"chat_image_b64,omitempty"` // base64 PNG for chat_send_image
+	Answers      map[string]string `json:"answers,omitempty"`        // AskUserQuestion answers
 	// Pane capture
 	Lines int `json:"lines,omitempty"` // lines of scrollback to capture
 	// Live Activity
@@ -121,6 +125,9 @@ type Server struct {
 	// The PermissionRequest hook handler blocks on this channel until iOS responds.
 	pendingApprovals   map[string]chan bool
 	pendingApprovalsMu sync.Mutex
+	// Pending AskUserQuestion answers: session → channel carrying JSON answers map.
+	pendingAnswers   map[string]chan map[string]string
+	pendingAnswersMu sync.Mutex
 }
 
 type liveActivityEntry struct {
@@ -199,6 +206,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		clientDeviceNames:  make(map[string]string),
 		directSessions:     make(map[string]*directSessionState),
 		pendingApprovals: make(map[string]chan bool),
+		pendingAnswers:   make(map[string]chan map[string]string),
 	}
 }
 
@@ -622,7 +630,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			// Fallback: no pending hook channel — the hook timed out and Claude Code
 			// is showing an interactive terminal prompt. Send Escape (dismiss any
 			// autocomplete dropdown) then Enter to select the default (Allow).
-			if s.IsDirectSession(msg.Session) {
+			if s.IsDirectSession(msg.Session) || s.hasAttachedShim(msg.Session) {
 				s.forwardToShim(msg.Session, "pty_input", map[string]string{
 					"session": msg.Session,
 					"data":    base64.StdEncoding.EncodeToString([]byte("\x1b")),
@@ -656,7 +664,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			default:
 			}
 		} else {
-			if s.IsDirectSession(msg.Session) {
+			if s.IsDirectSession(msg.Session) || s.hasAttachedShim(msg.Session) {
 				deny := "\x1b[B\r"
 				s.forwardToShim(msg.Session, "pty_input", map[string]string{
 					"session": msg.Session,
@@ -671,8 +679,8 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Session == "" || msg.Keys == "" {
 			break
 		}
-		// Default: send via PTY (direct sessions). Fall back to tmux only for tmux sessions.
-		if s.IsDirectSession(msg.Session) {
+		// Prefer shim PTY for direct or tmux-with-shim sessions. Fall back to tmux.
+		if s.IsDirectSession(msg.Session) || s.hasAttachedShim(msg.Session) {
 			s.forwardToShim(msg.Session, "pty_input", map[string]string{
 				"session": msg.Session,
 				"data":    base64.StdEncoding.EncodeToString([]byte(msg.Keys + "\n")),
@@ -684,6 +692,25 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 	case "request_chat_history":
 		if msg.Session != "" {
 			go s.sendChatHistory(msg.Session)
+		}
+
+	case "chat_send":
+		s.handleChatSend(client, msg)
+
+	case "chat_send_image":
+		s.handleChatSendImage(client, msg)
+
+	case "answer_question":
+		if msg.Session != "" && msg.Answers != nil {
+			s.pendingAnswersMu.Lock()
+			ch, ok := s.pendingAnswers[msg.Session]
+			s.pendingAnswersMu.Unlock()
+			if ok {
+				select {
+				case ch <- msg.Answers:
+				default:
+				}
+			}
 		}
 
 	case "kill_session":
@@ -812,14 +839,14 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		time.Sleep(300 * time.Millisecond)
 		// Send Ctrl+V (0x16) to the session so Claude Code reads the clipboard.
 		if msg.Session != "" {
-			if s.IsDirectSession(msg.Session) {
-				// Direct session: forward Ctrl+V through the shim's PTY.
+			if s.IsDirectSession(msg.Session) || s.hasAttachedShim(msg.Session) {
+				// Direct or tmux-with-shim: forward Ctrl+V through the shim's PTY.
 				s.forwardToShim(msg.Session, "pty_input", map[string]string{
 					"session": msg.Session,
 					"data":    base64.StdEncoding.EncodeToString([]byte{0x16}),
 				})
 			} else {
-				// tmux session: send via tmux send-keys.
+				// Pure tmux session: send via tmux send-keys.
 				_ = tmux.SendKeyNoEnter(msg.Session, "\x16")
 			}
 		}
@@ -1385,7 +1412,82 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		case client.send <- data:
 		default:
 		}
+
 	}
+
+}
+
+// handleChatSend injects a chat message into the running Claude session.
+// tmux sessions use tmux send-keys (local, reliable). Pure direct sessions
+// (Mac user's terminal with no tmux) use the shim's PTY injection.
+func (s *Server) handleChatSend(client *Client, msg InboundMessage) {
+	if msg.Session == "" || msg.ChatContent == "" {
+		return
+	}
+	if s.IsDirectSession(msg.Session) {
+		// Pure direct session (Mac user's terminal, no tmux): inject via shim PTY.
+		s.forwardToShim(msg.Session, "inject_message", map[string]string{
+			"content": msg.ChatContent,
+		})
+		// Same Escape+Enter submit sequence as tmux, routed through the shim PTY.
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			s.forwardToShim(msg.Session, "pty_input", map[string]string{
+				"session": msg.Session,
+				"data":    base64.StdEncoding.EncodeToString([]byte("\x1b")),
+			})
+			time.Sleep(100 * time.Millisecond)
+			s.forwardToShim(msg.Session, "pty_input", map[string]string{
+				"session": msg.Session,
+				"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
+			})
+		}()
+	} else {
+		// tmux session (iOS-created or tmux-wrapped): use tmux send-keys.
+		// This is local (Mac-side), so timing is reliable.
+		_ = tmux.SendKeys(msg.Session, msg.ChatContent)
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			_ = tmux.SendRawKeys(msg.Session, []string{"Escape"})
+			time.Sleep(100 * time.Millisecond)
+			_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
+		}()
+	}
+}
+
+// handleChatSendImage sets the Mac clipboard and tells the shim to paste (Ctrl+V).
+func (s *Server) handleChatSendImage(client *Client, msg InboundMessage) {
+	if msg.Session == "" || msg.ChatImageB64 == "" {
+		return
+	}
+	decoded, err := base64.StdEncoding.DecodeString(msg.ChatImageB64)
+	if err != nil {
+		log.Printf("chat_send_image decode: %v", err)
+		return
+	}
+	// Write PNG to /tmp, convert to TIFF, set clipboard (same as paste_image).
+	ts := time.Now().UnixNano()
+	pngPath := fmt.Sprintf("/tmp/opencapy_clip_%d.png", ts)
+	if err := os.WriteFile(pngPath, decoded, 0o644); err != nil {
+		log.Printf("chat_send_image write: %v", err)
+		return
+	}
+	tiffPath := fmt.Sprintf("/tmp/opencapy_clip_%d.tiff", ts)
+	if err := exec.Command("sips", "-s", "format", "tiff", pngPath, "--out", tiffPath).Run(); err != nil {
+		log.Printf("chat_send_image sips: %v — falling back to PNG", err)
+		tiffPath = pngPath
+	}
+	script := fmt.Sprintf(
+		`set the clipboard to (read (POSIX file "%s") as TIFF picture)`,
+		tiffPath,
+	)
+	if err := exec.Command("osascript", "-e", script).Run(); err != nil {
+		log.Printf("chat_send_image osascript: %v", err)
+		return
+	}
+	time.Sleep(300 * time.Millisecond)
+	// Tell the shim to paste (Ctrl+V).
+	s.forwardToShim(msg.Session, "inject_image", map[string]string{})
 }
 
 func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
@@ -1438,12 +1540,14 @@ func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
 	}
 
 	// Determine which command to auto-launch (if any).
+	// Route through the shim so the session is registered as a direct session
+	// and chat messages can be injected via the shim's local PTY.
 	claudeCmd := ""
 	switch msg.LaunchMode {
 	case "claude":
-		claudeCmd = "claude"
+		claudeCmd = "opencapy shim -- claude"
 	case "claude_skip":
-		claudeCmd = "claude --dangerously-skip-permissions"
+		claudeCmd = "opencapy shim -- claude --dangerously-skip-permissions"
 	}
 	if claudeCmd != "" {
 		time.Sleep(300 * time.Millisecond)
@@ -1729,15 +1833,26 @@ func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
 }
 
 // forwardToShim sends a message to the shim that owns the given direct session.
+// Also resolves tmux parent names: if `session` is a tmux session name, finds
+// the child shim whose parentTmux matches and forwards to it.
 func (s *Server) forwardToShim(session, msgType string, payload interface{}) {
 	s.directSessionsMu.RLock()
 	ds, ok := s.directSessions[session]
 	shimID := ""
 	if ok {
 		shimID = ds.shimClientID
+	} else {
+		// Reverse lookup: find child shim attached to this tmux session.
+		for _, child := range s.directSessions {
+			if child.parentTmux == session {
+				shimID = child.shimClientID
+				break
+			}
+		}
 	}
 	s.directSessionsMu.RUnlock()
 	if shimID == "" {
+		log.Printf("[forwardToShim] session=%q type=%q: no shim registered", session, msgType)
 		return
 	}
 	data, err := json.Marshal(OutboundMessage{Type: msgType, Payload: payload})
@@ -1747,11 +1862,15 @@ func (s *Server) forwardToShim(session, msgType string, payload interface{}) {
 	s.mu.RLock()
 	c, ok := s.clients[shimID]
 	s.mu.RUnlock()
-	if ok {
-		select {
-		case c.send <- data:
-		default:
-		}
+	if !ok {
+		log.Printf("[forwardToShim] session=%q type=%q: shim client %q disconnected", session, msgType, shimID)
+		return
+	}
+	select {
+	case c.send <- data:
+		log.Printf("[forwardToShim] session=%q type=%q: sent to shim %q", session, msgType, shimID)
+	default:
+		log.Printf("[forwardToShim] session=%q type=%q: shim send channel full", session, msgType)
 	}
 }
 
@@ -1941,12 +2060,27 @@ func directSessionName(projectPath, branch string) string {
 	return base + "-" + safeBranch + "-" + t
 }
 
-// IsDirectSession returns true if the named session was spawned by the claude shim.
+// IsDirectSession returns true if the named session is a pure direct session
+// (shim-owned PTY, no tmux). Tmux sessions with an attached child shim are NOT
+// direct sessions — their PTY I/O still goes through tmux/ptyMgr.
 func (s *Server) IsDirectSession(name string) bool {
 	s.directSessionsMu.RLock()
 	_, ok := s.directSessions[name]
 	s.directSessionsMu.RUnlock()
 	return ok
+}
+
+// hasAttachedShim returns true if the named tmux session has a child shim
+// attached (for message injection and approval routing).
+func (s *Server) hasAttachedShim(name string) bool {
+	s.directSessionsMu.RLock()
+	defer s.directSessionsMu.RUnlock()
+	for _, ds := range s.directSessions {
+		if ds.parentTmux == name {
+			return true
+		}
+	}
+	return false
 }
 
 
@@ -2024,7 +2158,53 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 	switch hookName {
 	case "PermissionRequest":
 		toolName, _ := payload["tool_name"].(string)
-		toolInputBytes, _ := json.Marshal(payload["tool_input"])
+		toolInput := payload["tool_input"]
+
+		// AskUserQuestion: send structured question data to iOS and wait for answers.
+		if toolName == "AskUserQuestion" {
+			toolInputBytes, _ := json.Marshal(toolInput)
+			s.sessionWatch.Emit(watcher.Event{
+				Type:      watcher.EventQuestion,
+				Session:   sessionName,
+				Content:   string(toolInputBytes),
+				Timestamp: time.Now(),
+			})
+			answerCh := make(chan map[string]string, 1)
+			s.pendingAnswersMu.Lock()
+			s.pendingAnswers[sessionName] = answerCh
+			s.pendingAnswersMu.Unlock()
+			defer func() {
+				s.pendingAnswersMu.Lock()
+				delete(s.pendingAnswers, sessionName)
+				s.pendingAnswersMu.Unlock()
+			}()
+			w.Header().Set("Content-Type", "application/json")
+			select {
+			case answers := <-answerCh:
+				// Merge answers into the original tool_input and return as updatedInput.
+				inputMap, _ := toolInput.(map[string]interface{})
+				if inputMap == nil {
+					inputMap = make(map[string]interface{})
+				}
+				inputMap["answers"] = answers
+				resp := map[string]interface{}{
+					"hookSpecificOutput": map[string]interface{}{
+						"hookEventName": "PermissionRequest",
+						"decision": map[string]interface{}{
+							"behavior":     "allow",
+							"updatedInput": inputMap,
+						},
+					},
+				}
+				respBytes, _ := json.Marshal(resp)
+				w.Write(respBytes)
+			case <-time.After(5 * time.Minute):
+				w.WriteHeader(http.StatusOK)
+			}
+			return
+		}
+
+		toolInputBytes, _ := json.Marshal(toolInput)
 		content := fmt.Sprintf("Permission needed: %s\n%s", toolName, string(toolInputBytes))
 		s.sessionWatch.Emit(watcher.Event{
 			Type:      watcher.EventApproval,
@@ -2170,7 +2350,7 @@ func (s *Server) handleHTTPApprove(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Fallback: send keystrokes to terminal.
 		if approved {
-			if s.IsDirectSession(session) {
+			if s.IsDirectSession(session) || s.hasAttachedShim(session) {
 				s.forwardToShim(session, "pty_input", map[string]string{
 					"session": session,
 					"data":    base64.StdEncoding.EncodeToString([]byte("\x1b")),
@@ -2657,7 +2837,18 @@ func parseChatHistory(path string) ([]ChatTurn, chatHistoryMeta) {
 	if cur != nil {
 		turns = append(turns, *cur)
 	}
-	return turns, meta
+	// Drop orphan turns — user messages with no Claude response and no tool activity.
+	// These are interrupt markers or abandoned messages. Keep the last turn
+	// (might be in-progress: user sent, Claude hasn't responded yet).
+	filtered := turns[:0]
+	for i, t := range turns {
+		isLast := i == len(turns)-1
+		hasResponse := t.ClaudeText != "" || t.ToolCount > 0
+		if hasResponse || isLast {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered, meta
 }
 
 // sendChatHistory reads the JSONL transcript for a session and broadcasts
@@ -2681,13 +2872,6 @@ func (s *Server) sendChatHistory(session string) {
 		}
 	}
 
-	// Last resort: scan the project directory for the most recently modified JSONL.
-	// Handles sessions from before the current daemon start where the registry has no entry.
-	if jsonlPath == "" {
-		if proj, ok := s.registry.GetProject(session); ok {
-			jsonlPath = discoverJSONLPath(proj)
-		}
-	}
 	if jsonlPath == "" {
 		return
 	}
