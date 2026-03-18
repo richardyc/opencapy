@@ -2089,15 +2089,13 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 		})
 		w.WriteHeader(http.StatusOK)
 	case "PostToolUse":
-		// Claude is processing tool results and generating the next response.
-		// Emit EventRunning so the title stays "running" during extended thinking
-		// between tool calls, not just during tool execution itself.
-		toolName, _ := payload["tool_name"].(string)
-		detail := toolSummary(toolName, payload["tool_input"])
+		// Keep session status as "running" while Claude processes the tool result,
+		// but send empty content — the tool name was already emitted by PreToolUse.
+		// Empty content tells iOS to count this as a keep-alive, not a new tool step.
 		s.sessionWatch.Emit(watcher.Event{
 			Type:      watcher.EventRunning,
 			Session:   sessionName,
-			Content:   detail,
+			Content:   "",
 			Timestamp: time.Now(),
 		})
 		w.WriteHeader(http.StatusOK)
