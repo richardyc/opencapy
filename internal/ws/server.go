@@ -58,6 +58,7 @@ type InboundMessage struct {
 	// Session creation fields
 	Mode        string `json:"mode,omitempty"`         // "chat" or "terminal"
 	ProjectPath string `json:"project_path,omitempty"` // working directory for new session
+	LaunchMode  string `json:"launch_mode,omitempty"`  // "terminal", "claude", "claude_skip"
 	// Pane capture
 	Lines int `json:"lines,omitempty"` // lines of scrollback to capture
 	// Live Activity
@@ -1436,10 +1437,17 @@ func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
 		_ = s.registry.Save()
 	}
 
-	// For chat mode, launch the AI assistant after a brief shell init delay.
-	if msg.Mode == "chat" {
+	// Determine which command to auto-launch (if any).
+	claudeCmd := ""
+	switch msg.LaunchMode {
+	case "claude":
+		claudeCmd = "claude"
+	case "claude_skip":
+		claudeCmd = "claude --dangerously-skip-permissions"
+	}
+	if claudeCmd != "" {
 		time.Sleep(300 * time.Millisecond)
-		_ = tmux.SendKeys(name, "claude")
+		_ = tmux.SendKeys(name, claudeCmd)
 	}
 
 	// Broadcast a fresh snapshot so all clients see the new session appear.
