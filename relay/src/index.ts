@@ -34,9 +34,9 @@ export default {
     if (request.headers.get("Upgrade") !== "websocket")
       return new Response("Expected WebSocket upgrade", { status: 426 });
 
-    const role = url.searchParams.get("role");
-    if (role !== "mac" && role !== "ios")
-      return new Response('role must be "mac" or "ios"', { status: 400 });
+    const role = url.searchParams.get("role") ?? "";
+    if (role !== "mac" && !role.startsWith("ios"))
+      return new Response('role must be "mac" or "ios[-*]"', { status: 400 });
 
     const id = env.RELAY.idFromName(match[1].toLowerCase());
     // Hint the DO location based on the connecting client's continent so the
@@ -127,7 +127,7 @@ async function pushLiveActivity(
 
 // ─── RelayRoom Durable Object ─────────────────────────────────────────────────
 
-type Role = "mac" | "ios";
+type Role = string; // "mac" | "ios" | "ios-<deviceTag>"
 interface Attachment { role: Role; connectedAt: number; }
 
 // DO storage keys:
@@ -166,11 +166,13 @@ export class RelayRoom {
     server.serializeAttachment(att);
     this.clients.set(server, att);
 
-    const peerPresent = [...this.clients.values()].some(a => a.role !== role);
+    const senderIsMac = role === "mac";
+    const peerPresent = [...this.clients.values()].some(a => (a.role === "mac") !== senderIsMac);
     server.send(JSON.stringify({ type: "relay_connected", role, peerPresent }));
     if (peerPresent) {
       for (const [ws, a] of this.clients) {
-        if (a.role !== role) ws.send(JSON.stringify({ type: "peer_connected", role }));
+        if ((a.role === "mac") !== senderIsMac)
+          ws.send(JSON.stringify({ type: "peer_connected", role }));
       }
     }
     return new Response(null, { status: 101, webSocket: client });
@@ -219,20 +221,22 @@ export class RelayRoom {
       } catch { /* not JSON or unrecognised — forward unchanged */ }
     }
 
-    // Forward to peer.
-    const targetRole: Role = sender.role === "mac" ? "ios" : "mac";
+    // Forward to all peers on the other side.
+    // mac → broadcast to ALL ios clients; ios → send to mac.
+    const senderIsMac = sender.role === "mac";
     for (const [targetWs, att] of this.clients) {
-      if (att.role === targetRole) { targetWs.send(message); return; }
+      if ((att.role === "mac") !== senderIsMac) targetWs.send(message);
     }
-    // Peer not connected — drop. It will re-sync on reconnect.
+    // If no peers connected, message is dropped — client will re-sync on reconnect.
   }
 
   async webSocketClose(ws: WebSocket, code: number): Promise<void> {
     const att = this.clients.get(ws);
     this.clients.delete(ws);
     if (att) {
+      const disconnectedIsMac = att.role === "mac";
       for (const [peerWs, peerAtt] of this.clients) {
-        if (peerAtt.role !== att.role)
+        if ((peerAtt.role === "mac") !== disconnectedIsMac)
           peerWs.send(JSON.stringify({ type: "peer_disconnected", role: att.role, code }));
       }
     }
