@@ -10,9 +10,11 @@ import (
 
 // GitFileStatus represents the status of a single file in a git repo.
 type GitFileStatus struct {
-	Path     string `json:"path"`
-	Staged   string `json:"staged"`   // 'M','A','D','R',' '
-	Unstaged string `json:"unstaged"` // 'M','D','?',' '
+	Path       string `json:"path"`
+	Staged     string `json:"staged"`              // 'M','A','D','R',' '
+	Unstaged   string `json:"unstaged"`            // 'M','D','?',' '
+	Additions  int    `json:"additions,omitempty"`  // lines added
+	Deletions  int    `json:"deletions,omitempty"`  // lines deleted
 }
 
 // GitStatusResult is the response for git_status and mutation operations.
@@ -106,7 +108,49 @@ func parseGitStatus(dir string) GitStatusResult {
 		})
 	}
 
+	// Enrich with line counts from git diff --numstat.
+	enrichNumstat(dir, &result)
+
 	return result
+}
+
+// enrichNumstat runs git diff --numstat (unstaged) and git diff --numstat --cached (staged)
+// and populates Additions/Deletions on each file.
+func enrichNumstat(dir string, result *GitStatusResult) {
+	// Unstaged changes
+	if out, err := runGit(dir, "diff", "--numstat"); err == nil {
+		applyNumstat(out, result, false)
+	}
+	// Staged changes
+	if out, err := runGit(dir, "diff", "--numstat", "--cached"); err == nil {
+		applyNumstat(out, result, true)
+	}
+}
+
+func applyNumstat(out string, result *GitStatusResult, staged bool) {
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		// Format: "added\tdeleted\tpath" (binary files show "-\t-\tpath")
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 3 || parts[0] == "-" {
+			continue
+		}
+		add, _ := strconv.Atoi(parts[0])
+		del, _ := strconv.Atoi(parts[1])
+		path := parts[2]
+		for i := range result.Files {
+			if result.Files[i].Path != path {
+				continue
+			}
+			isStaged := result.Files[i].Staged != " " && result.Files[i].Staged != "?"
+			if isStaged == staged {
+				result.Files[i].Additions = add
+				result.Files[i].Deletions = del
+			}
+		}
+	}
 }
 
 // parseCount extracts an integer after a keyword like "ahead " from a string like "[ahead 3, behind 1]".

@@ -8,10 +8,11 @@ import (
 
 // TreeNode represents a file or directory in the tree.
 type TreeNode struct {
-	Name     string     `json:"name"`
-	Path     string     `json:"path"`
-	IsDir    bool       `json:"is_dir"`
-	Children []TreeNode `json:"children,omitempty"`
+	Name      string     `json:"name"`
+	Path      string     `json:"path"`
+	IsDir     bool       `json:"is_dir"`
+	Children  []TreeNode `json:"children,omitempty"`
+	Truncated bool       `json:"truncated,omitempty"`
 }
 
 // skipDirs contains directory names that should never be descended into.
@@ -37,19 +38,21 @@ func hasSensitiveSuffix(name string) bool {
 // maxDepth=3 means the root plus 2 more directory levels are visible
 // (root → level-1 → level-2). Directories at level-2 are returned as nodes
 // but their children are not expanded.
-func BuildTree(root string, maxDepth int) (TreeNode, error) {
+// maxEntries caps the number of children per directory; 0 means unlimited.
+// When a directory has more entries than maxEntries, Truncated is set to true.
+func BuildTree(root string, maxDepth, maxEntries int) (TreeNode, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return TreeNode{}, err
 	}
-	return buildNode(abs, 0, maxDepth)
+	return buildNode(abs, 0, maxDepth, maxEntries)
 }
 
 // buildNode builds a TreeNode at the given path.
 // depth is the current recursion depth (root = 0).
 // A directory at depth d will only have its children expanded when d+1 < maxDepth,
 // so directories at depth maxDepth-1 are leaves (no children populated).
-func buildNode(path string, depth, maxDepth int) (TreeNode, error) {
+func buildNode(path string, depth, maxDepth, maxEntries int) (TreeNode, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return TreeNode{}, err
@@ -62,18 +65,16 @@ func buildNode(path string, depth, maxDepth int) (TreeNode, error) {
 	}
 
 	// Do not descend further once we would exceed maxDepth.
-	// depth+1 >= maxDepth means we are at the last visible level; listing
-	// children here would add entries at depth maxDepth which is beyond the limit.
 	if !info.IsDir() || depth+1 >= maxDepth {
 		return node, nil
 	}
 
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		// Return the node without children on permission errors etc.
 		return node, nil
 	}
 
+	count := 0
 	for _, entry := range entries {
 		name := entry.Name()
 
@@ -92,12 +93,18 @@ func buildNode(path string, depth, maxDepth int) (TreeNode, error) {
 			continue
 		}
 
+		if maxEntries > 0 && count >= maxEntries {
+			node.Truncated = true
+			break
+		}
+
 		childPath := filepath.Join(path, name)
-		child, err := buildNode(childPath, depth+1, maxDepth)
+		child, err := buildNode(childPath, depth+1, maxDepth, maxEntries)
 		if err != nil {
 			continue
 		}
 		node.Children = append(node.Children, child)
+		count++
 	}
 
 	return node, nil

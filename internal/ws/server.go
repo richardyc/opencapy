@@ -1198,7 +1198,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			}
 			break
 		}
-		tree, err := fs.BuildTree(msg.Path, 3)
+		tree, err := fs.BuildTree(msg.Path, 3, 200)
 		if err != nil {
 			log.Printf("list_dir %q: %v", msg.Path, err)
 			break
