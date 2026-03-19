@@ -19,6 +19,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/creack/pty"
 	"github.com/richardyc/opencapy/internal/config"
+	"github.com/richardyc/opencapy/internal/session"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -73,7 +74,8 @@ func newShimCmd() *cobra.Command {
 				"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
 				"cols":         cols,
 				"rows":         rows,
-				"inside_tmux":  os.Getenv("TMUX") != "",
+				"inside_parent":  os.Getenv("TMUX") != "" || os.Getenv("OPENCAPY_SESSION") != "",
+				"parent_session": os.Getenv("OPENCAPY_SESSION"),
 			}); err != nil {
 				return fallbackExec(claudePath, args)
 			}
@@ -81,6 +83,14 @@ func newShimCmd() *cobra.Command {
 			sessionName, err := waitSessionAssigned(ctx, conn)
 			if err != nil {
 				return fallbackExec(claudePath, args)
+			}
+
+			// When running inside a daemon session, use the parent session name
+			// for tab titles so the user sees "claude · myproject · idle" rather
+			// than the internal child name "claude · myproject-main-1358 · idle".
+			displayName := sessionName
+			if parent := os.Getenv("OPENCAPY_SESSION"); parent != "" {
+				displayName = parent
 			}
 
 			// Spawn claude in the user's context — natural env, no TCC prompts.
@@ -96,7 +106,7 @@ func newShimCmd() *cobra.Command {
 			}
 			defer ptmx.Close()
 
-			setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
+			session.SetTerminalTitle(os.Stderr, fmt.Sprintf("claude · %s · idle", displayName))
 
 			// Put terminal in raw mode if connected to a real TTY.
 			if isTerminal {
@@ -245,11 +255,11 @@ func newShimCmd() *cobra.Command {
 					// Ctrl+V to paste clipboard content (image set by daemon).
 					ptmx.Write([]byte{0x16}) //nolint:errcheck
 				case "event":
-					updateTitleFromEvent(sessionName, raw["payload"])
+					updateTitleFromEvent(sessionName, displayName, raw["payload"])
 				}
 			}
 
-			setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
+			session.SetTerminalTitle(os.Stderr, fmt.Sprintf("claude · %s · idle", displayName))
 			// WS disconnected — daemon may have restarted. Reconnect, re-register,
 			// and swap activeConn so PTY data resumes flowing to the new daemon.
 			// Claude keeps running throughout; we just restore the monitoring link.
@@ -279,7 +289,8 @@ func newShimCmd() *cobra.Command {
 						"project_path": cwd,
 						"branch":       os.Getenv("OPENCAPY_GIT_BRANCH"),
 						"buf":          base64.StdEncoding.EncodeToString(bufSnapshot),
-						"inside_tmux":  os.Getenv("TMUX") != "",
+						"inside_parent":  os.Getenv("TMUX") != "" || os.Getenv("OPENCAPY_SESSION") != "",
+				"parent_session": os.Getenv("OPENCAPY_SESSION"),
 					}
 					if wsjson.Write(ctx, newConn, rereg) != nil {
 						newConn.CloseNow()
@@ -330,7 +341,7 @@ func newShimCmd() *cobra.Command {
 						case "inject_image":
 							ptmx.Write([]byte{0x16}) //nolint:errcheck
 						case "event":
-							updateTitleFromEvent(sessionName, raw["payload"])
+							updateTitleFromEvent(sessionName, displayName, raw["payload"])
 						}
 					}
 					// Connection dropped again — loop to reconnect.
@@ -361,9 +372,9 @@ func waitSessionAssigned(ctx context.Context, conn *websocket.Conn) (string, err
 	}
 }
 
-// updateTitleFromEvent updates the terminal title on approval/done/crash events,
-// but only if the event belongs to this shim's session.
-func updateTitleFromEvent(sessionName string, payloadRaw json.RawMessage) {
+// updateTitleFromEvent updates the terminal title on approval/done/crash events.
+// sessionName is used for event matching; displayName is shown in the title.
+func updateTitleFromEvent(sessionName, displayName string, payloadRaw json.RawMessage) {
 	var payload struct {
 		Type    string `json:"type"`
 		Session string `json:"session"`
@@ -376,27 +387,22 @@ func updateTitleFromEvent(sessionName string, payloadRaw json.RawMessage) {
 	}
 	switch payload.Type {
 	case "running":
-		setTerminalTitle(fmt.Sprintf("claude · %s · running", sessionName))
+		session.SetTerminalTitle(os.Stderr, fmt.Sprintf("claude · %s · running", displayName))
 	case "approval":
-		setTerminalTitle(fmt.Sprintf("🔴 claude · %s · needs OK", sessionName))
+		session.SetTerminalTitle(os.Stderr, fmt.Sprintf("🔴 claude · %s · needs OK", displayName))
 	case "done":
-		setTerminalTitle(fmt.Sprintf("✓ claude · %s · done", sessionName))
-		// Revert to idle after a brief display so the tab doesn't stay on "done" forever.
+		session.SetTerminalTitle(os.Stderr, fmt.Sprintf("✓ claude · %s · done", displayName))
 		go func() {
 			time.Sleep(5 * time.Second)
-			setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
+			session.SetTerminalTitle(os.Stderr, fmt.Sprintf("claude · %s · idle", displayName))
 		}()
 	case "crash":
-		setTerminalTitle(fmt.Sprintf("✗ claude · %s · crashed", sessionName))
+		session.SetTerminalTitle(os.Stderr, fmt.Sprintf("✗ claude · %s · crashed", displayName))
 	case "idle":
-		setTerminalTitle(fmt.Sprintf("claude · %s · idle", sessionName))
+		session.SetTerminalTitle(os.Stderr, fmt.Sprintf("claude · %s · idle", displayName))
 	}
 }
 
-// setTerminalTitle updates the terminal window/tab title via OSC 0 escape.
-func setTerminalTitle(title string) {
-	fmt.Fprintf(os.Stderr, "\033]0;%s\007", title)
-}
 
 // oscTitleRe matches OSC 0/1/2 title-setting sequences that programs like
 // claude emit to set the terminal window/tab title. We strip these so the

@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -15,8 +14,7 @@ import (
 	"github.com/richardyc/opencapy/internal/platform"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/push"
-	ptymanager "github.com/richardyc/opencapy/internal/pty"
-	"github.com/richardyc/opencapy/internal/tmux"
+	"github.com/richardyc/opencapy/internal/session"
 	"github.com/richardyc/opencapy/internal/watcher"
 	"github.com/richardyc/opencapy/internal/ws"
 	"github.com/spf13/cobra"
@@ -50,28 +48,11 @@ func newDaemonCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "warning: could not load registry: %v\n", err)
 			}
 
-			// Reconcile registry against live tmux sessions.
-			// Also auto-register any tmux session not yet in the registry (using its Cwd)
-			// so that file browsing works for sessions started outside of opencapy.
-			liveSessions, lsErr := tmux.ListSessions()
-			if lsErr == nil && reg != nil {
-				liveNames := make(map[string]bool)
-				for _, s := range liveSessions {
-					liveNames[s.Name] = true
-					if _, ok := reg.GetProject(s.Name); !ok && s.Cwd != "" {
-						_ = reg.Register(s.Name, s.Cwd)
-					}
-				}
-				for name := range reg.All() {
-					if !liveNames[name] {
-						_ = reg.Unregister(name)
-					}
-				}
-				_ = reg.Save()
-			}
+			// Create session manager
+			sessMgr := session.NewManager()
 
-			// Start watcher
-			w := watcher.New(time.Duration(cfg.PollInterval) * time.Millisecond)
+			// Start watcher (event-driven via FeedOutput callback)
+			w := watcher.New()
 
 			// Load existing sessions into watcher
 			if reg != nil {
@@ -82,8 +63,16 @@ func newDaemonCmd() *cobra.Command {
 
 			go w.Start(ctx)
 
-			// Apply tmux scroll bindings (1 line/event vs default 5, Magic Trackpad fix)
-			tmux.ApplyScrollConfig()
+			// Start Unix socket for CLI communication.
+			// ListenSocket removes stale sockets on startup — no defer cleanup
+			// needed here, as a launchd-restarted daemon would race against it.
+			sockPath := session.SocketPath()
+			defer sessMgr.KillAll()
+			go func() {
+				if err := sessMgr.ListenSocket(ctx, sockPath); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: socket listener: %v\n", err)
+				}
+			}()
 
 			// Load push registry
 			pushReg, pushErr := push.Load(filepath.Join(os.Getenv("HOME"), ".opencapy"))
@@ -98,23 +87,8 @@ func newDaemonCmd() *cobra.Command {
 				}
 			}
 
-			// Create PTY manager
-			ptyMgr := ptymanager.NewManager()
-
 			// Start WebSocket server
-			srv := ws.New(cfg.Port, w, reg, pushReg, ptyMgr)
-
-			// Forward tmux PTY output events to the owning iOS client.
-			go func() {
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case out := <-ptyMgr.Events():
-						srv.SendPTYOutput(out)
-					}
-				}
-			}()
+			srv := ws.New(cfg.Port, w, reg, pushReg, sessMgr)
 
 			// Start file watcher
 			fw, fwErr := fsevent.New()
@@ -146,9 +120,8 @@ func newDaemonCmd() *cobra.Command {
 				}()
 			}
 
-			// Session reconciler: every 2 s, diff live tmux sessions against the
-			// registry.  Adds sessions created on Mac, removes sessions killed on Mac,
-			// and broadcasts a snapshot to iOS whenever anything changed.
+			// Session reconciler: every 2 s, sync daemon sessions with registry
+			// and broadcast snapshot to iOS when anything changed.
 			go func() {
 				ticker := time.NewTicker(2 * time.Second)
 				defer ticker.Stop()
@@ -157,23 +130,16 @@ func newDaemonCmd() *cobra.Command {
 					case <-ctx.Done():
 						return
 					case <-ticker.C:
-						live, err := tmux.ListSessions()
-						if err != nil {
-							continue
-						}
-						liveMap := make(map[string]string, len(live))
-						for _, s := range live {
-							// Skip internal PTY mirror sessions (ocpy_*).
-							if strings.HasPrefix(s.Name, "ocpy_") {
-								continue
-							}
-							liveMap[s.Name] = s.Cwd
+						daemonSessions := sessMgr.List()
+						daemonMap := make(map[string]string, len(daemonSessions))
+						for _, s := range daemonSessions {
+							daemonMap[s.Name] = s.Cwd
 						}
 
 						changed := false
 
-						// Add sessions that exist in tmux but not in the registry/watcher.
-						for name, cwd := range liveMap {
+						// Add daemon sessions not yet in watcher/registry.
+						for name, cwd := range daemonMap {
 							if !w.HasSession(name) {
 								w.AddSession(name, cwd)
 								if fw != nil {
@@ -187,11 +153,11 @@ func newDaemonCmd() *cobra.Command {
 							}
 						}
 
-						// Remove sessions that are in the registry but no longer in tmux.
-						// Skip direct sessions — they are managed by the shim, not tmux.
+						// Remove dead daemon sessions from registry.
+						// Skip direct sessions — they are managed by the shim.
 						if reg != nil {
 							for name := range reg.All() {
-								if _, alive := liveMap[name]; !alive {
+								if _, alive := daemonMap[name]; !alive {
 									if srv.IsDirectSession(name) {
 										continue
 									}

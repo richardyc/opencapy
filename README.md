@@ -77,44 +77,45 @@ The relay is a Cloudflare Durable Objects WebSocket broker. No ports are opened 
 opencapy                    # full-screen TUI session chooser (↑↓ navigate, Enter attach, d kill, n new)
 opencapy [name]             # attach to named session (error if not found; use 'new' to create)
 opencapy new [name]         # create new session (name defaults to cwd basename)
+opencapy new [name] --claude # create session with claude directly
 opencapy attach [name]      # reattach to existing session
-opencapy here               # new session per terminal tab (for VSCode/Cursor profiles)
-opencapy ls                 # same as opencapy — full-screen TUI
 opencapy kill [name]        # kill a session
 opencapy approve [name]     # send approval keystroke (y + Enter)
 opencapy deny [name]        # send deny keystroke (n + Enter)
-opencapy status             # daemon health, connected iOS clients, registered devices
-opencapy qr                 # print iOS pairing QR code (Tailscale hostname auto-detected)
+opencapy status             # daemon health, connected iOS clients, session count
+opencapy qr                 # print iOS pairing QR code
 opencapy daemon             # start daemon in foreground (for debugging)
 opencapy install            # install as system service (LaunchAgent on Mac, systemd on Linux)
-opencapy install --vscode   # also configure VSCode/Cursor terminal profile to use opencapy here
 opencapy update             # upgrade via brew and restart daemon
 opencapy version            # print version + build info
 ```
 
+**Session persistence:** `opencapy new` creates a daemon-owned PTY session. Detach with Enter then `~.` — the session keeps running. Reattach later with `opencapy attach <name>` or from the TUI.
+
 ## How it works
 
-1. `opencapy new` creates a tmux session with a capybara brown status bar and registers it in `~/.opencapy/sessions.json`
-2. The daemon reconciles live tmux sessions every 2s — sessions created or killed on Mac appear/disappear on iOS automatically
-3. The daemon polls every 500ms via `tmux capture-pane`, detecting Claude Code events by regex:
-   - **Approval:** matches `do you want to proceed`, `[y/n]`, `❯ 1. yes`
-   - **Crash:** matches `Traceback`, `panic:`, `fatal error:`
-   - **Done:** matches `task complete`
-4. Events stream to the iOS app over WebSocket (port 7242), along with live pane output (last 15 lines, 1s cooldown)
-5. For approval events, the daemon scans a wider 50-line window to extract the `⏺ ToolName(...)` context shown in the iOS prompt card
-6. PTY creation is two-step: first `tmux new-session -d` (detached, synchronous) to create the grouped session and apply styling (`status-style bg=#7B5B3A,fg=#F5E6D3`) and disable mouse (`set-option mouse off`), then `attach-session` opens the PTY. Mouse is explicitly disabled on the grouped session to prevent tmux from emitting mouse-tracking escape sequences that would intercept iOS UIScrollView pan gestures in SwiftTerm
-7. Native image paste: iOS sends PNG bytes → daemon writes to `/tmp`, sets Mac clipboard via `osascript`, sends `C-v` to the tmux session → Claude Code pastes the image inline
-8. For direct sessions (claude shim), the daemon reads Claude Code's JSONL transcript to provide chat history and last user message previews in the session list. Orphan turns (user messages with no Claude response from interrupts) are filtered out
-9. Chat messages sent from iOS are injected via the shim PTY (direct sessions) or tmux send-keys, both using the Escape+Enter submit sequence
-10. When the iOS app is backgrounded, push notifications are delivered via APNs
+1. `opencapy new` creates a daemon-owned PTY session registered in `~/.opencapy/sessions.json`
+2. The daemon owns the PTY directly — no tmux required
+3. The shim (`opencapy shim -- claude`) wraps Claude Code to intercept hook events and stream PTY output to the daemon
+4. Events stream to the iOS app over WebSocket (port 7242): approvals, tool executions, done, crashes
+5. PTY output is buffered in a 2MB ring buffer per session and streamed live to iOS
+6. For approval events, the daemon sends the tool context so iOS shows the exact permission being requested
+7. Native image paste: iOS sends PNG bytes → daemon writes to `/tmp`, sets Mac clipboard via `osascript`, sends Ctrl+V to the session → Claude Code pastes the image inline
+8. Chat messages from iOS are injected via bracketed paste (direct shim channel) — no timing hacks
+9. The daemon reads Claude Code's JSONL transcript to provide chat history and model/token metadata
+10. When the iOS app is backgrounded, push notifications and lock screen Live Activities fire via APNs
 
-## iOS connectivity
+## Session detach and reattach
 
-**Tailscale (recommended for Mac):**
-Connect via your Tailscale hostname (e.g. `richard-mbp.tail12345.ts.net`) — no port forwarding needed. Run `opencapy qr` and scan with the iOS app to pair automatically.
+```bash
+# Detach from any session without killing it
+Enter then ~.
 
-**SSH tunnel (Linux/VPS):**
-The iOS app generates an Ed25519 keypair, you add the public key to `~/.ssh/authorized_keys`, and the app creates a local port forward to the daemon. Private keys are stored in the iOS Keychain.
+# Reattach later
+opencapy attach myproject
+```
+
+Sessions survive SSH disconnects, terminal window closes, and daemon restarts.
 
 ## WebSocket protocol
 
@@ -126,14 +127,14 @@ The daemon exposes a WebSocket server on port 7242.
 | `snapshot` | Full session list on connect (name, projectPath, lastOutput, created, lastActive, recentEvents, lastUserMessage) |
 | `event` | Claude Code event (approval/thinking/file_edit/crash/done/output) |
 | `file_event` | File changed by Claude Code (path, content, deleted flag) |
-| `file_tree` | Directory tree response (depth 3, excludes .git, node_modules, *.key, *.pem) |
-| `file_content` | File read response (path, content base64, size — max 1MB) |
+| `file_tree` | Directory tree response |
+| `file_content` | File read response (path, content base64, size) |
 | `file_write_ack` | File write confirmation |
-| `pane_content` | Scrollback history capture (300 lines by default) |
+| `pane_content` | Scrollback history (base64-encoded PTY bytes) |
 | `pty_output` | Raw terminal bytes (base64, sent only to owning client) |
 | `session_created` | New session created via iOS request |
-| `image_pasted` | Clipboard set and C-v sent; iOS should refocus terminal (no compose bar shown) |
-| `chat_history` | Parsed JSONL transcript as user→assistant turns (session, turns[]) |
+| `image_pasted` | Clipboard set and Ctrl+V sent |
+| `chat_history` | Parsed JSONL transcript as user→assistant turns |
 | `pong` | Heartbeat response |
 | `error` | Error message |
 
@@ -142,25 +143,25 @@ The daemon exposes a WebSocket server on port 7242.
 |---|---|
 | `approve` | Send approval keystroke to session |
 | `deny` | Send deny keystroke to session |
-| `send_keys` | Send arbitrary keys to session (tmux send-keys, appends Enter) |
-| `kill_session` | Kill a tmux session and unregister it |
-| `refresh_sessions` | Request a fresh snapshot (sent to requesting client only) |
-| `paste_image` | PNG bytes (base64); daemon sets Mac clipboard + sends C-v to session |
+| `send_keys` | Send arbitrary keys to session (appends Enter) |
+| `kill_session` | Kill session and unregister |
+| `refresh_sessions` | Request fresh snapshot (requesting client only) |
+| `paste_image` | PNG bytes (base64); daemon sets Mac clipboard + sends Ctrl+V |
 | `register_push` | Register APNs device token |
-| `new_session` | Create session (mode: "terminal" opens shell) |
+| `new_session` | Create session (mode, project_path, launch_mode) |
 | `list_dir` | Request directory tree for a path |
 | `file_read` | Request file content |
 | `file_write` | Write file content (base64) |
-| `capture_pane` | Fetch pane scrollback history |
-| `open_pty` | Open a PTY for raw terminal access (uses grouped tmux session) |
+| `capture_pane` | Fetch PTY scrollback history |
+| `open_pty` | Subscribe iOS client to session PTY output |
 | `pty_input` | Send bytes to PTY (base64) |
 | `pty_resize` | Resize PTY (cols/rows) |
-| `close_pty` | Close PTY |
-| `chat_send` | Send chat message to session (text injected via shim or tmux; Escape+Enter submitted) |
-| `chat_send_image` | Send PNG image (base64) to session (sets clipboard, Ctrl+V paste) |
-| `answer_question` | Answer an AskUserQuestion prompt (session, answers map) |
-| `request_chat_history` | Request parsed JSONL transcript for a direct session |
-| `register_live_activity` | Register per-activity APNs push token for a session (fields: session, token, machine) |
+| `close_pty` | Unsubscribe from PTY output |
+| `chat_send` | Send chat message (injected via shim bracketed paste or direct PTY write) |
+| `chat_send_image` | Send PNG image (base64) to session (sets clipboard, Ctrl+V) |
+| `answer_question` | Answer AskUserQuestion prompt (session, answers map) |
+| `request_chat_history` | Request parsed JSONL transcript |
+| `register_live_activity` | Register per-activity APNs token (session, token, machine) |
 | `ping` | Heartbeat (30s interval) |
 
 ### HTTP endpoints
@@ -195,11 +196,7 @@ wrangler secret put APNS_TEAM_ID   # e.g. XYZ9876543
 wrangler deploy
 ```
 
-The relay then pushes Live Activity updates directly from Cloudflare — users configure nothing.
-
-### Option B — Direct mode (Tailscale / SSH, embedded at build time)
-
-For direct connections that bypass the relay, bake credentials into the daemon binary:
+### Option B — Direct mode (embedded at build time)
 
 ```bash
 cp internal/push/credentials_release.go.template \
@@ -208,12 +205,9 @@ cp internal/push/credentials_release.go.template \
 go build -tags release ./...
 ```
 
-`credentials_release.go` is gitignored. Release binaries (e.g. Homebrew) should be built
-with `-tags release` so end users install a binary that just works.
+`credentials_release.go` is gitignored. Release binaries should be built with `-tags release`.
 
 ### Option C — config.json (advanced / self-hosted)
-
-Configure per-machine in `~/.opencapy/config.json`:
 
 ```json
 {
@@ -230,16 +224,9 @@ Configure per-machine in `~/.opencapy/config.json`:
 
 Without any of the above, the daemon runs fine — push notifications are disabled, all other features work.
 
-Notifications fire when no iOS client is connected (app backgrounded):
-- **Approval needed** — Claude Code is waiting for your input
-- **Session crashed** — with error detail
-- **Task complete** — Claude Code finished
-
 ## Requirements
 
 - macOS 13+ or Linux (amd64/arm64)
-- tmux 3.0+
-- For iOS connectivity: Tailscale (Mac) or SSH access (Linux/VPS)
 - For push notifications: Apple Developer Program membership
 
 ## Building a client

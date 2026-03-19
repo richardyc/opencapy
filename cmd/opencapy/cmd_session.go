@@ -12,9 +12,17 @@ import (
 
 	"github.com/richardyc/opencapy/internal/config"
 	"github.com/richardyc/opencapy/internal/project"
-	"github.com/richardyc/opencapy/internal/tmux"
+	"github.com/richardyc/opencapy/internal/session"
 	"github.com/spf13/cobra"
 )
+
+// defaultShell returns the user's shell from $SHELL, falling back to /bin/sh.
+func defaultShell() string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
 
 // ensureDaemon checks if the daemon is running and starts it in the background if not.
 // Strips CLAUDECODE from the daemon's environment so it can spawn claude sessions
@@ -56,28 +64,8 @@ func filteredEnv() []string {
 	return env
 }
 
-// tmuxRequired prints a helpful message and returns an error when tmux is
-// unavailable. All TUI/session commands that need tmux call this first.
-func tmuxRequired() error {
-	if _, err := exec.LookPath("tmux"); err == nil {
-		return nil
-	}
-	fmt.Println("This command requires tmux, which is not installed.")
-	fmt.Println()
-	fmt.Println("To monitor Claude sessions without tmux, just run:  claude")
-	fmt.Println()
-	fmt.Println("To install tmux:")
-	fmt.Println("  macOS:  brew install tmux")
-	fmt.Println("  Ubuntu: sudo apt install tmux")
-	fmt.Println("  Arch:   sudo pacman -S tmux")
-	return fmt.Errorf("tmux not found")
-}
-
 // runRoot is the default command: interactive chooser (no args) or attach-only (with name).
 func runRoot(cmd *cobra.Command, args []string) error {
-	if err := tmuxRequired(); err != nil {
-		return nil // message already printed, exit cleanly
-	}
 	ensureDaemon()
 
 	cwd, err := os.Getwd()
@@ -90,22 +78,20 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		return runTUI(cwd)
 	}
 
-	// Explicit name → attach ONLY. Typos fail loudly; use 'opencapy new' to create.
+	// Explicit name → attach ONLY.
 	name := args[0]
-	exists, err := tmux.SessionExists(name)
-	if err != nil {
-		return fmt.Errorf("check session: %w", err)
-	}
-	if !exists {
+	if !session.SessionExists(name) {
 		return fmt.Errorf("session %q not found — use 'opencapy new %s' to create it", name, name)
 	}
 	fmt.Printf("Attaching to session %q\n", name)
-	return tmux.Attach(name)
+	cols, rows := session.GetTerminalSize()
+	return session.Attach(name, rows, cols)
 }
 
 // createSession creates and registers a new session, then attaches.
-func createSession(name, cwd string) error {
-	if err := tmux.NewSession(name, cwd); err != nil {
+func createSession(name, cwd string, command string, args []string) error {
+	cols, rows := session.GetTerminalSize()
+	if _, err := session.CreateSession(name, cwd, command, args, rows, cols); err != nil {
 		return fmt.Errorf("create session: %w", err)
 	}
 	reg, err := project.Load()
@@ -115,16 +101,16 @@ func createSession(name, cwd string) error {
 		fmt.Fprintf(os.Stderr, "warning: could not register session: %v\n", err)
 	}
 	fmt.Printf("Created session %q (%s)\n", name, cwd)
-	return tmux.Attach(name)
+	return session.Attach(name, rows, cols)
 }
 
 func newNewCmd() *cobra.Command {
-	return &cobra.Command{
+	var claudeFlag bool
+	cmd := &cobra.Command{
 		Use:   "new [name]",
-		Short: "Create a new tmux session (name defaults to current directory)",
+		Short: "Create a new session (name defaults to current directory)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := tmuxRequired(); err != nil { return err }
 			ensureDaemon()
 			cwd, err := os.Getwd()
 			if err != nil {
@@ -134,26 +120,31 @@ func newNewCmd() *cobra.Command {
 			if len(args) > 0 {
 				name = args[0]
 			}
-			exists, err := tmux.SessionExists(name)
-			if err != nil {
-				return fmt.Errorf("check session: %w", err)
-			}
-			if exists {
+			if session.SessionExists(name) {
 				return fmt.Errorf("session %q already exists — use 'opencapy %s' to attach", name, name)
 			}
-			return createSession(name, cwd)
+			command := defaultShell()
+			var cmdArgs []string
+			if claudeFlag {
+				command = "claude"
+				cmdArgs = nil
+			}
+			return createSession(name, cwd, command, cmdArgs)
 		},
 	}
+	cmd.Flags().BoolVar(&claudeFlag, "claude", false, "Start claude directly in the session")
+	return cmd
 }
 
 func newAttachCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "attach <name>",
-		Short: "Attach to an existing tmux session",
+		Short: "Attach to an existing session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := tmuxRequired(); err != nil { return err }
-			return tmux.Attach(args[0])
+			ensureDaemon()
+			cols, rows := session.GetTerminalSize()
+			return session.Attach(args[0], rows, cols)
 		},
 	}
 }
@@ -161,12 +152,12 @@ func newAttachCmd() *cobra.Command {
 func newKillCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "kill <name>",
-		Short: "Kill a tmux session by name",
+		Short: "Kill a session by name",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := tmuxRequired(); err != nil { return err }
+			ensureDaemon()
 			name := args[0]
-			if err := tmux.KillSession(name); err != nil {
+			if err := session.KillSession(name); err != nil {
 				return fmt.Errorf("kill session: %w", err)
 			}
 			reg, err := project.Load()
@@ -185,8 +176,8 @@ func newApproveCmd() *cobra.Command {
 		Short: "Send approval keystroke to a session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := tmuxRequired(); err != nil { return err }
-			return tmux.SendKeys(args[0], "y")
+			ensureDaemon()
+			return session.SendInput(args[0], "y\n")
 		},
 	}
 }
@@ -197,8 +188,8 @@ func newDenyCmd() *cobra.Command {
 		Short: "Send deny keystroke to a session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := tmuxRequired(); err != nil { return err }
-			return tmux.SendKeys(args[0], "n")
+			ensureDaemon()
+			return session.SendInput(args[0], "n\n")
 		},
 	}
 }

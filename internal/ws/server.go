@@ -24,11 +24,10 @@ import (
 	fs "github.com/richardyc/opencapy/internal/fs"
 	"github.com/richardyc/opencapy/internal/mdns"
 	"github.com/richardyc/opencapy/internal/platform"
-	ptymanager "github.com/richardyc/opencapy/internal/pty"
 	"github.com/richardyc/opencapy/internal/project"
 	"github.com/richardyc/opencapy/internal/push"
 	"github.com/richardyc/opencapy/internal/relay"
-	"github.com/richardyc/opencapy/internal/tmux"
+	"github.com/richardyc/opencapy/internal/session"
 	"github.com/richardyc/opencapy/internal/watcher"
 )
 
@@ -71,7 +70,8 @@ type InboundMessage struct {
 	Branch   string `json:"branch,omitempty"`    // git branch at launch
 	ExitCode int    `json:"exit_code,omitempty"` // process exit code, sent in session_end
 	Buf        string `json:"buf,omitempty"`          // base64 PTY ring buffer snapshot for reregister
-	InsideTmux bool   `json:"inside_tmux,omitempty"` // true when shim is running inside a tmux session
+	InsideParent  bool   `json:"inside_parent,omitempty"`  // true when shim is running inside a parent session (e.g. tmux, daemon session)
+	ParentSession string `json:"parent_session,omitempty"` // OPENCAPY_SESSION value — daemon session name containing this shim
 }
 
 // SessionSnapshot holds a point-in-time snapshot of a session's state.
@@ -82,7 +82,7 @@ type SessionSnapshot struct {
 	Created         time.Time       `json:"created"`
 	LastActive      time.Time       `json:"last_active"`
 	RecentEvents    []watcher.Event `json:"recent_events,omitempty"`
-	SessionType     string          `json:"session_type"`                // "tmux" or "direct"
+	SessionType     string          `json:"session_type"`                // "daemon" or "direct"
 	LastUserMessage string          `json:"last_user_message,omitempty"` // last user input from JSONL transcript
 	Branch          string          `json:"branch,omitempty"`            // git branch at session launch
 	ModelName       string          `json:"model_name,omitempty"`        // e.g. "claude-opus-4-6"
@@ -106,7 +106,7 @@ type Server struct {
 	sessionWatch *watcher.Watcher
 	registry     *project.Registry
 	push         *push.Registry
-	ptyMgr       *ptymanager.Manager
+	sessMgr      *session.Manager
 	mu           sync.RWMutex
 	recentEvents      map[string][]watcher.Event // last 50 non-output events per session
 	sessionLastActive map[string]time.Time       // last meaningful activity per session (from hooks)
@@ -118,7 +118,7 @@ type Server struct {
 	// Populated when iOS registers a Live Activity (which includes the machine name).
 	clientDeviceNames   map[string]string
 	clientDeviceNamesMu sync.RWMutex
-	// Direct sessions: spawned by the claude shim, not tmux.
+	// Direct sessions: spawned by the claude shim, not the daemon.
 	directSessions   map[string]*directSessionState
 	directSessionsMu sync.RWMutex
 	// Pending approval channels: session → channel awaiting iOS approve/deny decision.
@@ -136,7 +136,7 @@ type liveActivityEntry struct {
 	lastPush    time.Time // throttle output-driven Live Activity updates
 }
 
-// directSessionState tracks a session spawned by the claude shim (no tmux involved).
+// directSessionState tracks a session spawned by the claude shim.
 type directSessionState struct {
 	shimClientID    string    // WS client ID of the shim that owns this session
 	cwd             string
@@ -146,7 +146,7 @@ type directSessionState struct {
 	createdAt       time.Time
 	buf             []byte    // ring buffer of raw PTY output (last ~32 KB)
 	subscribers     []string  // iOS client IDs subscribed via open_pty
-	parentTmux      string    // if set, this is a child of a tmux session (hidden from session list)
+	parentSession      string    // if set, this is a child of a daemon session (hidden from session list)
 	// Cached JSONL metadata — only re-parsed when file size changes.
 	cachedModel     string
 	cachedTokens    int
@@ -177,7 +177,7 @@ type chatHistoryMeta struct {
 	ResultText  string  // final result text (for "result" type records)
 }
 
-const directBufMax = 256 * 1024 // 256 KB ring buffer per direct session
+const directBufMax = 2 * 1024 * 1024 // 2 MB ring buffer per direct session
 
 // daemonProtocolVersion is sent in the hello message on every new connection.
 // Increment when making breaking changes to the WebSocket protocol so the iOS
@@ -185,7 +185,7 @@ const directBufMax = 256 * 1024 // 256 KB ring buffer per direct session
 const daemonProtocolVersion = 1
 
 // New creates a new WebSocket server.
-func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Registry, ptyMgr *ptymanager.Manager) *Server {
+func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Registry, sessMgr *session.Manager) *Server {
 	// Load (or generate on first run) the persistent relay pairing token.
 	relayToken, err := relay.LoadOrCreate()
 	if err != nil {
@@ -199,7 +199,7 @@ func New(port int, w *watcher.Watcher, reg *project.Registry, pushReg *push.Regi
 		sessionWatch:       w,
 		registry:           reg,
 		push:               pushReg,
-		ptyMgr:             ptyMgr,
+		sessMgr:            sessMgr,
 		recentEvents:       make(map[string][]watcher.Event),
 		sessionLastActive:  make(map[string]time.Time),
 		liveActivityTokens: make(map[string]liveActivityEntry),
@@ -451,7 +451,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	log.Printf("Client connected: %s", clientID)
-	go s.refreshTmuxStatus()
 
 	ctx := r.Context()
 
@@ -532,10 +531,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		delete(s.clientDeviceNames, clientID)
 		s.clientDeviceNamesMu.Unlock()
 
-		// Clean up all PTY sessions owned by this client
-		if s.ptyMgr != nil {
-			s.ptyMgr.CloseByClient(clientID)
-		}
+		// No PTY cleanup needed — daemon sessions persist across client disconnects.
 
 		// Deregister any direct sessions owned by this shim client.
 		s.directSessionsMu.Lock()
@@ -566,8 +562,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		close(client.send)
 		conn.CloseNow()
 		log.Printf("Client disconnected: %s", clientID)
-		go s.refreshTmuxStatus()
-		go s.BroadcastSnapshot()
+			go s.BroadcastSnapshot()
 	}()
 
 	for {
@@ -642,11 +637,11 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 						"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
 					})
 				}()
-			} else {
-				_ = tmux.SendRawKeys(msg.Session, []string{"Escape"})
+			} else if sess := s.sessMgr.Get(msg.Session); sess != nil {
+				_ = sess.Write([]byte("\x1b"))
 				go func() {
 					time.Sleep(100 * time.Millisecond)
-					_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
+					_ = sess.Write([]byte("\r"))
 				}()
 			}
 		}
@@ -670,8 +665,8 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 					"session": msg.Session,
 					"data":    base64.StdEncoding.EncodeToString([]byte(deny)),
 				})
-			} else {
-				_ = tmux.SendRawKeys(msg.Session, []string{"Down", "Enter"})
+			} else if sess := s.sessMgr.Get(msg.Session); sess != nil {
+				_ = sess.Write([]byte("\x1b[B\r"))
 			}
 		}
 
@@ -679,14 +674,13 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		if msg.Session == "" || msg.Keys == "" {
 			break
 		}
-		// Prefer shim PTY for direct or tmux-with-shim sessions. Fall back to tmux.
 		if s.IsDirectSession(msg.Session) || s.hasAttachedShim(msg.Session) {
 			s.forwardToShim(msg.Session, "pty_input", map[string]string{
 				"session": msg.Session,
 				"data":    base64.StdEncoding.EncodeToString([]byte(msg.Keys + "\n")),
 			})
-		} else {
-			_ = tmux.SendKeys(msg.Session, msg.Keys)
+		} else if sess := s.sessMgr.Get(msg.Session); sess != nil {
+			_ = sess.Write([]byte(msg.Keys + "\n"))
 		}
 
 	case "request_chat_history":
@@ -721,11 +715,8 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 				break
 			}
 			log.Printf("kill_session: killing %q", msg.Session)
-			if s.ptyMgr != nil {
-				s.ptyMgr.Close(msg.Session)
-			}
-			if err := tmux.KillSession(msg.Session); err != nil {
-				log.Printf("kill_session %q: tmux error: %v", msg.Session, err)
+			if err := s.sessMgr.Kill(msg.Session); err != nil {
+				log.Printf("kill_session %q: error: %v", msg.Session, err)
 			} else {
 				log.Printf("kill_session %q: done", msg.Session)
 			}
@@ -758,8 +749,7 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			s.clientDeviceNames[client.ID] = msg.Name
 			s.clientDeviceNamesMu.Unlock()
 			log.Printf("Device name registered: %s (%s)", msg.Name, client.ID)
-			go s.refreshTmuxStatus()
-		}
+				}
 
 	case "register_live_activity":
 		if msg.Session != "" && msg.Token != "" {
@@ -770,13 +760,12 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			}
 			s.liveActivityTokensMu.Unlock()
 			log.Printf("[live activity] registered token for session %s (machine=%s)", msg.Session, msg.Machine)
-			// Store the device name so we can show it in the tmux status bar.
+			// Store the device name for display purposes.
 			if msg.Machine != "" {
 				s.clientDeviceNamesMu.Lock()
 				s.clientDeviceNames[client.ID] = msg.Machine
 				s.clientDeviceNamesMu.Unlock()
-				go s.refreshTmuxStatus()
-			}
+						}
 		}
 
 	// paste_image: decode base64 PNG, write to /tmp, set Mac clipboard via
@@ -840,14 +829,13 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 		// Send Ctrl+V (0x16) to the session so Claude Code reads the clipboard.
 		if msg.Session != "" {
 			if s.IsDirectSession(msg.Session) || s.hasAttachedShim(msg.Session) {
-				// Direct or tmux-with-shim: forward Ctrl+V through the shim's PTY.
+				// Direct or shim-attached session: forward Ctrl+V through the shim's PTY.
 				s.forwardToShim(msg.Session, "pty_input", map[string]string{
 					"session": msg.Session,
 					"data":    base64.StdEncoding.EncodeToString([]byte{0x16}),
 				})
-			} else {
-				// Pure tmux session: send via tmux send-keys.
-				_ = tmux.SendKeyNoEnter(msg.Session, "\x16")
+			} else if sess := s.sessMgr.Get(msg.Session); sess != nil {
+				_ = sess.Write([]byte{0x16})
 			}
 		}
 		sendImageAck("")
@@ -872,28 +860,28 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 				jsonlPath = claudeJSONLPath(msg.ProjectPath, id)
 			}
 		}
-		// If the shim is running inside a tmux session, attach claude metadata
+		// If the shim is running inside a parent session, attach claude metadata
 		// to the parent instead of creating a separate direct session.
-		var tmuxName string
-		if msg.InsideTmux {
-			tmuxName = s.findTmuxSessionByCwd(msg.ProjectPath)
+		var parentName string
+		if msg.InsideParent {
+			parentName = s.resolveParentSession(msg.ParentSession, msg.ProjectPath)
 		}
-		if tmuxName != "" {
+		if parentName != "" {
 			s.directSessionsMu.Lock()
 			s.directSessions[msg.Session] = &directSessionState{
 				shimClientID: client.ID,
 				cwd:          msg.ProjectPath,
 				buf:          restoredBuf,
-				parentTmux:   tmuxName,
+				parentSession:   parentName,
 			}
 			s.directSessionsMu.Unlock()
-			// Persist claude session ID under the tmux name so sendChatHistory works.
+			// Persist claude session ID under the parent name so sendChatHistory works.
 			if s.registry != nil && claudeID != "" {
-				_ = s.registry.SetClaudeSessionID(tmuxName, claudeID)
+				_ = s.registry.SetClaudeSessionID(parentName, claudeID)
 			}
-			log.Printf("[hook] session %q attached to tmux %q", msg.Session, tmuxName)
+			log.Printf("[hook] session %q attached to parent %q", msg.Session, parentName)
 			go s.BroadcastSnapshot()
-			go s.sendChatHistory(tmuxName)
+			go s.sendChatHistory(parentName)
 			break
 		}
 		s.directSessionsMu.Lock()
@@ -936,22 +924,22 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			break
 		}
 		sessionName := directSessionName(msg.ProjectPath, msg.Branch)
-		// If the shim is inside tmux, attach as child instead of creating a separate session.
-		var tmuxName string
-		if msg.InsideTmux {
-			tmuxName = s.findTmuxSessionByCwd(msg.ProjectPath)
+		// If the shim is inside a parent session, attach as child instead of creating a separate session.
+		var parentName string
+		if msg.InsideParent {
+			parentName = s.resolveParentSession(msg.ParentSession, msg.ProjectPath)
 		}
-		if tmuxName != "" {
+		if parentName != "" {
 			s.directSessionsMu.Lock()
 			s.directSessions[sessionName] = &directSessionState{
 				shimClientID: client.ID,
 				cwd:          msg.ProjectPath,
 				branch:       msg.Branch,
-				parentTmux:   tmuxName,
+				parentSession:   parentName,
 				createdAt:    time.Now(),
 			}
 			s.directSessionsMu.Unlock()
-			log.Printf("[hook] session %q attached to tmux %q", sessionName, tmuxName)
+			log.Printf("[hook] session %q attached to parent %q", sessionName, parentName)
 			// Still send ack so the shim knows its assigned name.
 			ack, _ := json.Marshal(OutboundMessage{
 				Type:    "session_assigned",
@@ -1075,8 +1063,9 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			s.directSessionsMu.Unlock()
 			break
 		}
-		if s.ptyMgr != nil {
-			s.ptyMgr.Close(msg.Session)
+		// Daemon session: unsubscribe iOS client.
+		if sess := s.sessMgr.Get(msg.Session); sess != nil {
+			sess.Unsubscribe(client.ID)
 		}
 
 	case "open_pty":
@@ -1104,10 +1093,12 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			if !ok {
 				break
 			}
-			// Send ring buffer as pane_content so SwiftTerm populates scrollback.
+			// Send full ring buffer as pane_content (base64).
+			// base64 is 1.33x overhead vs the old string encoding which expanded
+			// 6x due to \u001b escaping — so 256KB ring → ~341KB, iOS handles fine.
 			paneMsg, _ := json.Marshal(OutboundMessage{
 				Type:    "pane_content",
-				Payload: map[string]string{"session": msg.Session, "content": string(history)},
+				Payload: map[string]string{"session": msg.Session, "content": base64.StdEncoding.EncodeToString(history)},
 			})
 			select {
 			case client.send <- paneMsg:
@@ -1117,19 +1108,43 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			go s.sendChatHistory(msg.Session)
 			break
 		}
-		if s.ptyMgr == nil {
-			break
-		}
-		// Tmux session: close any stale PTY and open a new grouped session.
-		s.ptyMgr.Close(msg.Session)
-		startDir := ""
-		if s.registry != nil {
-			if p, ok := s.registry.GetProject(msg.Session); ok {
-				startDir = p
+		// Daemon session: subscribe iOS client to session output.
+		if sess := s.sessMgr.Get(msg.Session); sess != nil {
+			output, replay := sess.Subscribe(client.ID)
+			if len(replay) > 0 {
+				paneMsg, _ := json.Marshal(OutboundMessage{
+					Type:    "pane_content",
+					Payload: map[string]string{"session": msg.Session, "content": base64.StdEncoding.EncodeToString(replay)},
+				})
+				select {
+				case client.send <- paneMsg:
+				default:
+				}
 			}
-		}
-		if err := s.ptyMgr.Open(msg.Session, client.ID, cols, rows, startDir); err != nil {
-			log.Printf("open_pty %q: %v", msg.Session, err)
+			// Relay output to iOS client as pty_output messages.
+			go func() {
+				for data := range output {
+					outMsg, _ := json.Marshal(OutboundMessage{
+						Type: "pty_output",
+						Payload: map[string]interface{}{
+							"session": msg.Session,
+							"data":    base64.StdEncoding.EncodeToString(data),
+						},
+					})
+					s.mu.RLock()
+					c, ok := s.clients[client.ID]
+					s.mu.RUnlock()
+					if !ok {
+						sess.Unsubscribe(client.ID)
+						return
+					}
+					select {
+					case c.send <- outMsg:
+					default:
+					}
+				}
+			}()
+			go s.sendChatHistory(msg.Session)
 		}
 
 	case "pty_input":
@@ -1144,17 +1159,23 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			})
 			break
 		}
-		// tmux session: write directly to the grouped PTY.
-		if s.ptyMgr == nil {
-			break
-		}
+		// Daemon session: write directly to PTY.
+		// Filter out terminal query responses (CPR, OSC color) that the iOS
+		// terminal emulator generates automatically — they must not reach the
+		// shell's stdin where they'd appear as garbage typed input.
 		decoded, err := base64.StdEncoding.DecodeString(msg.Data)
 		if err != nil {
 			log.Printf("pty_input decode: %v", err)
 			break
 		}
-		if err := s.ptyMgr.Write(msg.Session, decoded); err != nil {
-			log.Printf("pty_input write %q: %v", msg.Session, err)
+		filtered := session.FilterTerminalResponses(decoded)
+		if len(filtered) == 0 {
+			break
+		}
+		if sess := s.sessMgr.Get(msg.Session); sess != nil {
+			if err := sess.Write(filtered); err != nil {
+				log.Printf("pty_input write %q: %v", msg.Session, err)
+			}
 		}
 
 	case "pty_resize":
@@ -1173,12 +1194,9 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 			})
 			break
 		}
-		// tmux session: resize the grouped PTY.
-		if s.ptyMgr == nil {
-			break
-		}
-		if err := s.ptyMgr.Resize(msg.Session, cols, rows); err != nil {
-			log.Printf("pty_resize %q: %v", msg.Session, err)
+		// Daemon session: resize PTY.
+		if sess := s.sessMgr.Get(msg.Session); sess != nil {
+			sess.Resize(uint16(cols), uint16(rows))
 		}
 
 	// ── File messages ─────────────────────────────────────────────────────────
@@ -1268,19 +1286,8 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 				output = string(ds.buf)
 			}
 			s.directSessionsMu.RUnlock()
-		} else {
-			lines := msg.Lines
-			if lines <= 0 {
-				lines = 300
-			}
-			// Plain text (no -e) so SwiftTerm accumulates scrollback lines instead
-			// of cursor-positioning escape sequences that prevent scrollback growth.
-			var err error
-			output, err = tmux.CapturePaneOutput(msg.Session, lines, false)
-			if err != nil {
-				log.Printf("capture_pane %q: %v", msg.Session, err)
-				break
-			}
+		} else if sess := s.sessMgr.Get(msg.Session); sess != nil {
+			output = string(sess.RingSnapshot())
 		}
 		data, _ := json.Marshal(OutboundMessage{
 			Type:    "pane_content",
@@ -1418,40 +1425,23 @@ func (s *Server) handleInbound(ctx context.Context, client *Client, msg InboundM
 }
 
 // handleChatSend injects a chat message into the running Claude session.
-// tmux sessions use tmux send-keys (local, reliable). Pure direct sessions
-// (Mac user's terminal with no tmux) use the shim's PTY injection.
+// For sessions with a shim (direct or daemon with child shim), forwards via
+// inject_message which uses bracketed paste + Enter — the shim handles submission.
+// For pure daemon sessions (plain shell, no claude), writes raw input to PTY.
 func (s *Server) handleChatSend(client *Client, msg InboundMessage) {
 	if msg.Session == "" || msg.ChatContent == "" {
 		return
 	}
-	if s.IsDirectSession(msg.Session) {
-		// Pure direct session (Mac user's terminal, no tmux): inject via shim PTY.
+	if s.IsDirectSession(msg.Session) || s.hasAttachedShim(msg.Session) {
+		// Shim handles injection via bracketed paste + submit internally.
 		s.forwardToShim(msg.Session, "inject_message", map[string]string{
 			"content": msg.ChatContent,
 		})
-		// Same Escape+Enter submit sequence as tmux, routed through the shim PTY.
-		go func() {
-			time.Sleep(300 * time.Millisecond)
-			s.forwardToShim(msg.Session, "pty_input", map[string]string{
-				"session": msg.Session,
-				"data":    base64.StdEncoding.EncodeToString([]byte("\x1b")),
-			})
-			time.Sleep(100 * time.Millisecond)
-			s.forwardToShim(msg.Session, "pty_input", map[string]string{
-				"session": msg.Session,
-				"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
-			})
-		}()
-	} else {
-		// tmux session (iOS-created or tmux-wrapped): use tmux send-keys.
-		// This is local (Mac-side), so timing is reliable.
-		_ = tmux.SendKeys(msg.Session, msg.ChatContent)
-		go func() {
-			time.Sleep(300 * time.Millisecond)
-			_ = tmux.SendRawKeys(msg.Session, []string{"Escape"})
-			time.Sleep(100 * time.Millisecond)
-			_ = tmux.SendRawKeys(msg.Session, []string{"Enter"})
-		}()
+		return
+	}
+	// Pure daemon session (shell, no claude shim): write as typed input.
+	if sess := s.sessMgr.Get(msg.Session); sess != nil {
+		_ = sess.Write([]byte(msg.ChatContent + "\n"))
 	}
 }
 
@@ -1493,7 +1483,7 @@ func (s *Server) handleChatSendImage(client *Client, msg InboundMessage) {
 func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
 	// Resolve working directory: use provided path, first registered project, or home dir.
 	cwd := msg.ProjectPath
-	// Expand leading ~ because tmux's -c flag does not perform tilde expansion.
+	// Expand leading ~ (shell-style tilde expansion).
 	if cwd == "~" {
 		if h, err := os.UserHomeDir(); err == nil {
 			cwd = h
@@ -1520,7 +1510,20 @@ func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
 	}
 	name := fmt.Sprintf("%s-%s", prefix, time.Now().Format("0102-150405"))
 
-	if err := tmux.NewSession(name, cwd); err != nil {
+	// Determine which command to spawn in the session.
+	command := defaultShell()
+	var cmdArgs []string
+	switch msg.LaunchMode {
+	case "claude":
+		command = "opencapy"
+		cmdArgs = []string{"shim", "--", "claude"}
+	case "claude_skip":
+		command = "opencapy"
+		cmdArgs = []string{"shim", "--", "claude", "--dangerously-skip-permissions"}
+	}
+
+	sess, err := s.sessMgr.Create(name, cwd, command, cmdArgs, 80, 24)
+	if err != nil {
 		log.Printf("new_session create %q: %v", name, err)
 		data, _ := json.Marshal(OutboundMessage{
 			Type:    "error",
@@ -1533,25 +1536,15 @@ func (s *Server) handleNewSession(client *Client, msg InboundMessage) {
 		return
 	}
 
+	// Wire output callback for watcher integration.
+	sess.OnOutput = func(sname string, data []byte) {
+		s.sessionWatch.FeedOutput(sname, string(data))
+	}
+
 	// Register so isPathAllowed passes for file browsing.
 	if s.registry != nil {
 		_ = s.registry.Register(name, cwd)
 		_ = s.registry.Save()
-	}
-
-	// Determine which command to auto-launch (if any).
-	// Route through the shim so the session is registered as a direct session
-	// and chat messages can be injected via the shim's local PTY.
-	claudeCmd := ""
-	switch msg.LaunchMode {
-	case "claude":
-		claudeCmd = "opencapy shim -- claude"
-	case "claude_skip":
-		claudeCmd = "opencapy shim -- claude --dangerously-skip-permissions"
-	}
-	if claudeCmd != "" {
-		time.Sleep(300 * time.Millisecond)
-		_ = tmux.SendKeys(name, claudeCmd)
 	}
 
 	// Broadcast a fresh snapshot so all clients see the new session appear.
@@ -1803,38 +1796,9 @@ func (s *Server) BroadcastSnapshot() {
 	}
 }
 
-// SendPTYOutput sends pty_output to the iOS client that owns this tmux PTY session.
-// Direct sessions stream via pty_data messages instead — this is tmux-only.
-func (s *Server) SendPTYOutput(out ptymanager.PTYOutput) {
-	if out.Data == nil {
-		return
-	}
-	msg := OutboundMessage{
-		Type: "pty_output",
-		Payload: map[string]interface{}{
-			"session": out.Session,
-			"data":    base64.StdEncoding.EncodeToString(out.Data),
-		},
-	}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-	s.mu.RLock()
-	c, ok := s.clients[out.ClientID]
-	s.mu.RUnlock()
-	if !ok {
-		return
-	}
-	select {
-	case c.send <- data:
-	default:
-	}
-}
-
 // forwardToShim sends a message to the shim that owns the given direct session.
-// Also resolves tmux parent names: if `session` is a tmux session name, finds
-// the child shim whose parentTmux matches and forwards to it.
+// Also resolves parent names: if `session` is a daemon session, finds the child
+// shim whose parentSession matches and forwards to it.
 func (s *Server) forwardToShim(session, msgType string, payload interface{}) {
 	s.directSessionsMu.RLock()
 	ds, ok := s.directSessions[session]
@@ -1842,9 +1806,9 @@ func (s *Server) forwardToShim(session, msgType string, payload interface{}) {
 	if ok {
 		shimID = ds.shimClientID
 	} else {
-		// Reverse lookup: find child shim attached to this tmux session.
+		// Reverse lookup: find child shim attached to this parent session.
 		for _, child := range s.directSessions {
-			if child.parentTmux == session {
+			if child.parentSession == session {
 				shimID = child.shimClientID
 				break
 			}
@@ -1874,101 +1838,50 @@ func (s *Server) forwardToShim(session, msgType string, payload interface{}) {
 	}
 }
 
-// refreshTmuxStatus updates the right side of the tmux status bar to show
-// how many iOS devices are connected (and the device name when only one is).
-// Device names are populated once the iOS app registers a Live Activity.
-func (s *Server) refreshTmuxStatus() {
-	s.mu.RLock()
-	count := len(s.clients)
-	s.mu.RUnlock()
-
-	if count == 0 {
-		// No phone connected — show pairing guide so first-time CLI users
-		// know what to do next.
-		host := platform.Hostname()
-		tmux.SetGlobalStatusRight(fmt.Sprintf("  \U0001F4F1 %s:%d  ", host, s.port))
-		tmux.SetGlobalStatusLeft("  #[fg=red]●#[default] No phone · run `opencapy qr` to pair  ")
-		return
-	}
-
-	s.clientDeviceNamesMu.RLock()
-	seen := map[string]bool{}
-	var uniqueNames []string
-	for _, name := range s.clientDeviceNames {
-		if name != "" && !seen[name] {
-			seen[name] = true
-			uniqueNames = append(uniqueNames, name)
-		}
-	}
-	s.clientDeviceNamesMu.RUnlock()
-
-	var text string
-	switch {
-	case len(uniqueNames) == 1:
-		text = fmt.Sprintf("  #[fg=green]●#[default] %s  ", uniqueNames[0])
-	case len(uniqueNames) > 1:
-		text = fmt.Sprintf("  #[fg=green]●#[default] %d iPhones  ", len(uniqueNames))
-	case count == 1:
-		text = "  #[fg=green]●#[default] 1 phone  "
-	default:
-		text = fmt.Sprintf("  #[fg=green]●#[default] %d phones  ", count)
-	}
-
-	tmux.SetGlobalStatusRight(text)
-	// Clear the pairing guide once a phone is connected.
-	tmux.SetGlobalStatusLeft("")
-}
-
 // snapshotSessions builds a snapshot of all currently-registered sessions.
 func (s *Server) snapshotSessions() []SessionSnapshot {
 	var snapshots []SessionSnapshot
 
-	sessions, err := tmux.ListSessions()
-	if err != nil {
-		return snapshots
-	}
-
-	for _, sess := range sessions {
-		// Skip internal PTY mirror sessions created by opencapy itself.
-		if strings.HasPrefix(sess.Name, "ocpy_") {
+	// Daemon-owned sessions.
+	for _, info := range s.sessMgr.List() {
+		sess := s.sessMgr.Get(info.Name)
+		if sess == nil {
 			continue
 		}
-		projectPath := sess.Cwd
+		projectPath := info.Cwd
 		if s.registry != nil {
-			if p, ok := s.registry.GetProject(sess.Name); ok {
+			if p, ok := s.registry.GetProject(info.Name); ok {
 				projectPath = p
 			}
 		}
 
-		output, _ := tmux.CapturePaneOutput(sess.Name, 20, true)
-		// Trim to last 20 lines just in case
+		ring := sess.RingSnapshot()
+		output := string(ring)
 		lines := strings.Split(output, "\n")
 		if len(lines) > 20 {
 			lines = lines[len(lines)-20:]
 		}
 
 		s.recentMu.RLock()
-		recent := append([]watcher.Event{}, s.recentEvents[sess.Name]...)
-		lastActive := s.sessionLastActive[sess.Name]
+		recent := append([]watcher.Event{}, s.recentEvents[info.Name]...)
+		lastActive := s.sessionLastActive[info.Name]
 		s.recentMu.RUnlock()
 
-		// Use tracked last-active from meaningful events (hooks); fall back to
-		// tmux's session_activity for cold-boot ordering before any hooks have fired.
 		if lastActive.IsZero() {
-			lastActive = sess.LastActive
+			lastActive = info.CreatedAt
 		}
 		snap := SessionSnapshot{
-			Name:         sess.Name,
+			Name:         info.Name,
 			ProjectPath:  projectPath,
 			LastOutput:   strings.Join(lines, "\n"),
-			Created:      sess.Created,
+			Created:      info.CreatedAt,
 			LastActive:   lastActive,
 			RecentEvents: recent,
-			SessionType:  "tmux",
+			SessionType:  "daemon",
 		}
-		// Attach claude metadata if claude is running inside this tmux session.
+		// Attach claude metadata if claude is running inside this session.
 		if s.registry != nil {
-			if cid, ok := s.registry.GetClaudeSessionID(sess.Name); ok {
+			if cid, ok := s.registry.GetClaudeSessionID(info.Name); ok {
 				jp := claudeJSONLPath(projectPath, cid)
 				snap.LastUserMessage = lastUserMessageFromJSONL(jp)
 				model, tokens := sessionMetaFromJSONL(jp)
@@ -1982,11 +1895,11 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 		snapshots = append(snapshots, snap)
 	}
 
-	// Append direct (non-tmux) sessions that are NOT children of a tmux session.
+	// Append direct (shim-owned) sessions that are NOT children of a daemon session.
 	s.directSessionsMu.RLock()
 	for name, ds := range s.directSessions {
-		if ds.parentTmux != "" {
-			continue // hidden — metadata is on the parent tmux session
+		if ds.parentSession != "" {
+			continue // hidden — metadata is on the parent daemon session
 		}
 		s.recentMu.RLock()
 		recent := append([]watcher.Event{}, s.recentEvents[name]...)
@@ -2046,6 +1959,15 @@ func (s *Server) snapshotSessions() []SessionSnapshot {
 //
 //	myrepo-feat-login-fix-1432
 //	myrepo-1432   (no branch)
+// (filterTerminalResponses moved to internal/session — use session.FilterTerminalResponses)
+
+func defaultShell() string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
+
 func directSessionName(projectPath, branch string) string {
 	base := filepath.Base(projectPath)
 	if base == "" || base == "." {
@@ -2061,8 +1983,8 @@ func directSessionName(projectPath, branch string) string {
 }
 
 // IsDirectSession returns true if the named session is a pure direct session
-// (shim-owned PTY, no tmux). Tmux sessions with an attached child shim are NOT
-// direct sessions — their PTY I/O still goes through tmux/ptyMgr.
+// (shim-owned PTY). Daemon sessions with an attached child shim are NOT
+// direct sessions — their PTY I/O goes through the daemon session.
 func (s *Server) IsDirectSession(name string) bool {
 	s.directSessionsMu.RLock()
 	_, ok := s.directSessions[name]
@@ -2070,20 +1992,18 @@ func (s *Server) IsDirectSession(name string) bool {
 	return ok
 }
 
-// hasAttachedShim returns true if the named tmux session has a child shim
+// hasAttachedShim returns true if the named daemon session has a child shim
 // attached (for message injection and approval routing).
 func (s *Server) hasAttachedShim(name string) bool {
 	s.directSessionsMu.RLock()
 	defer s.directSessionsMu.RUnlock()
 	for _, ds := range s.directSessions {
-		if ds.parentTmux == name {
+		if ds.parentSession == name {
 			return true
 		}
 	}
 	return false
 }
-
-
 
 // handleClaudeHook receives structured events from Claude Code's hook system
 // and emits them to iOS clients. This replaces the fragile PTY string-matching
@@ -2107,11 +2027,11 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 	claudeSessionID, _ := payload["session_id"].(string)
 
 	// Session name comes from the OPENCAPY_SESSION env var, passed as ?session= query param.
-	// If missing (claude run directly without the shim, e.g. inside a tmux session whose
+	// If missing (claude run directly without the shim, e.g. inside a session whose
 	// shell hasn't sourced the opencapy init yet), fall back to matching by CWD.
 	sessionName := r.URL.Query().Get("session")
 	if sessionName == "" && cwd != "" {
-		sessionName = s.findTmuxSessionByCwd(cwd)
+		sessionName = s.findSessionByCwd(cwd)
 	}
 	if sessionName == "" {
 		log.Printf("[hook] %s: no session for cwd=%q", hookName, cwd)
@@ -2121,37 +2041,37 @@ func (s *Server) handleClaudeHook(w http.ResponseWriter, r *http.Request) {
 
 	// SessionStart: bind Claude Code's session_id and JSONL path.
 	if hookName == "SessionStart" {
-		var parentTmux string
+		var parentSession string
 		s.directSessionsMu.Lock()
 		if ds, ok := s.directSessions[sessionName]; ok {
 			ds.cwd = cwd
-			parentTmux = ds.parentTmux
+			parentSession = ds.parentSession
 			if claudeSessionID != "" {
 				ds.claudeSessionID = claudeSessionID
 				ds.jsonlPath = claudeJSONLPath(cwd, claudeSessionID)
 			}
 		}
 		s.directSessionsMu.Unlock()
-		// Persist claude session ID — under parent tmux name if applicable.
+		// Persist claude session ID — under parent session name if applicable.
 		persistName := sessionName
-		if parentTmux != "" {
-			persistName = parentTmux
+		if parentSession != "" {
+			persistName = parentSession
 		}
 		if s.registry != nil && claudeSessionID != "" {
 			_ = s.registry.SetClaudeSessionID(persistName, claudeSessionID)
 		}
 		log.Printf("[hook] SessionStart: %q → %q sessionID=%q", sessionName, persistName, claudeSessionID)
-		if parentTmux != "" {
-			go s.sendChatHistory(parentTmux)
+		if parentSession != "" {
+			go s.sendChatHistory(parentSession)
 		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Remap to parent tmux session so events land on the right session in iOS.
+	// Remap to parent session so events land on the right session in iOS.
 	s.directSessionsMu.RLock()
-	if ds, ok := s.directSessions[sessionName]; ok && ds.parentTmux != "" {
-		sessionName = ds.parentTmux
+	if ds, ok := s.directSessions[sessionName]; ok && ds.parentSession != "" {
+		sessionName = ds.parentSession
 	}
 	s.directSessionsMu.RUnlock()
 
@@ -2362,11 +2282,11 @@ func (s *Server) handleHTTPApprove(w http.ResponseWriter, r *http.Request) {
 						"data":    base64.StdEncoding.EncodeToString([]byte("\r")),
 					})
 				}()
-			} else {
-				_ = tmux.SendRawKeys(session, []string{"Escape"})
+			} else if sess := s.sessMgr.Get(session); sess != nil {
+				_ = sess.Write([]byte("\x1b"))
 				go func() {
 					time.Sleep(100 * time.Millisecond)
-					_ = tmux.SendRawKeys(session, []string{"Enter"})
+					_ = sess.Write([]byte("\r"))
 				}()
 			}
 		}
@@ -2427,15 +2347,13 @@ func (s *Server) dialRelay(ctx context.Context, wsURL string) error {
 	s.clients[clientID] = client
 	s.mu.Unlock()
 	log.Printf("[relay] connected as mac (token …%s)", s.relayToken[len(s.relayToken)-8:])
-	go s.refreshTmuxStatus()
 
 	defer func() {
 		s.mu.Lock()
 		delete(s.clients, clientID)
 		s.mu.Unlock()
 		close(client.send)
-		go s.refreshTmuxStatus()
-	}()
+		}()
 
 	// Writer goroutine: drain client.send → relay WebSocket
 	writerDone := make(chan struct{})
@@ -2635,21 +2553,26 @@ func sessionMetaFromJSONL(path string) (modelName string, inputTokens int) {
 	return modelName, inputTokens
 }
 
-// findTmuxSessionByCwd returns the name of a tmux session whose cwd matches,
-// or "" if none found. Used to attach claude metadata to the parent tmux session.
-func (s *Server) findTmuxSessionByCwd(cwd string) string {
-	sessions, err := tmux.ListSessions()
-	if err != nil {
-		return ""
+// resolveParentSession returns the daemon session name that owns a shim process.
+// It tries the explicit name from OPENCAPY_SESSION first (set in the daemon PTY
+// env), then falls back to CWD matching for shimss started outside a daemon session.
+func (s *Server) resolveParentSession(explicitName, cwd string) string {
+	if explicitName != "" && s.sessMgr.Exists(explicitName) {
+		return explicitName
 	}
-	for _, sess := range sessions {
-		if sess.Cwd == cwd {
-			return sess.Name
+	return s.findSessionByCwd(cwd)
+}
+
+// findDaemonSessionByCwd returns the name of a daemon session whose cwd matches,
+// or "" if none found. Used to attach claude metadata to the parent session.
+func (s *Server) findSessionByCwd(cwd string) string {
+	for _, info := range s.sessMgr.List() {
+		if info.Cwd == cwd {
+			return info.Name
 		}
-		// Also check registry in case tmux cwd drifted.
 		if s.registry != nil {
-			if p, ok := s.registry.GetProject(sess.Name); ok && p == cwd {
-				return sess.Name
+			if p, ok := s.registry.GetProject(info.Name); ok && p == cwd {
+				return info.Name
 			}
 		}
 	}
@@ -2863,7 +2786,7 @@ func (s *Server) sendChatHistory(session string) {
 	}
 	s.directSessionsMu.RUnlock()
 
-	// Fall back to registry (covers tmux sessions with claude running inside).
+	// Fall back to registry (covers daemon sessions with claude running inside).
 	if jsonlPath == "" && s.registry != nil {
 		if cid, ok := s.registry.GetClaudeSessionID(session); ok {
 			if proj, ok := s.registry.GetProject(session); ok {

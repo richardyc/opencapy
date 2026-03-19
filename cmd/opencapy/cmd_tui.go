@@ -11,7 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/richardyc/opencapy/internal/project"
-	"github.com/richardyc/opencapy/internal/tmux"
+	"github.com/richardyc/opencapy/internal/session"
 )
 
 // ── styles ────────────────────────────────────────────────────────────────────
@@ -24,18 +24,17 @@ var (
 	styleNew     = lipgloss.NewStyle().Foreground(lipgloss.Color("#7B5B3A")).Bold(true)
 	styleHelp    = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
 	styleConfirm = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6B6B")).Bold(true)
-	styleDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
 )
 
 // ── model ────────────────────────────────────────────────────────────────────
 
 type tuiModel struct {
-	sessions []tmux.Session
+	sessions []session.SessionInfo
 	reg      *project.Registry
 	cwd      string
 	cwdBase  string
 	cursor   int
-	confirm  int  // index of session pending kill confirmation, -1 = none
+	confirm  int // index of session pending kill confirmation, -1 = none
 	action   func() error
 	width    int
 	height   int
@@ -64,7 +63,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirm = -1
 				name := m.sessions[idx].Name
 				m.action = func() error {
-					if err := tmux.KillSession(name); err != nil {
+					if err := session.KillSession(name); err != nil {
 						return fmt.Errorf("kill session: %w", err)
 					}
 					reg, err := project.Load()
@@ -100,12 +99,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Create new session
 				name, cwd := m.cwdBase, m.cwd
 				m.action = func() error {
-					return createSession(name, cwd)
+					return createSession(name, cwd, defaultShell(), nil)
 				}
 			} else {
 				name := m.sessions[m.cursor].Name
 				m.action = func() error {
-					return tmux.Attach(name)
+					cols, rows := session.GetTerminalSize()
+					return session.Attach(name, rows, cols)
 				}
 			}
 			return m, tea.Quit
@@ -113,7 +113,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "n":
 			name, cwd := m.cwdBase, m.cwd
 			m.action = func() error {
-				return createSession(name, cwd)
+				return createSession(name, cwd, defaultShell(), nil)
 			}
 			return m, tea.Quit
 
@@ -136,18 +136,18 @@ func (m tuiModel) View() string {
 	nameW := 20
 	pathW := 28
 	createdW := 14
-	activeW := 12
+	statusW := 12
 
 	// Header
 	header := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s",
 		nameW, "SESSION",
 		pathW, "PATH",
 		createdW, "CREATED",
-		activeW, "LAST ACTIVE",
+		statusW, "STATUS",
 	)
 	b.WriteString(styleHeader.Render(header) + "\n")
 
-	divider := "  " + strings.Repeat("─", nameW+pathW+createdW+activeW+8)
+	divider := "  " + strings.Repeat("─", nameW+pathW+createdW+statusW+8)
 	b.WriteString(styleDivider.Render(divider) + "\n")
 
 	// Session rows
@@ -160,8 +160,11 @@ func (m tuiModel) View() string {
 		}
 		path = shortenPath(path)
 
-		created := humanDuration(time.Since(s.Created))
-		active := humanDuration(time.Since(s.LastActive))
+		created := humanDuration(time.Since(s.CreatedAt))
+		status := "alive"
+		if !s.Alive {
+			status = "dead"
+		}
 
 		name := truncate(s.Name, nameW)
 		pathStr := truncate(path, pathW)
@@ -170,7 +173,7 @@ func (m tuiModel) View() string {
 			nameW, name,
 			pathW, pathStr,
 			createdW, created,
-			activeW, active,
+			statusW, status,
 		)
 
 		if m.confirm == i {
@@ -243,9 +246,9 @@ func humanDuration(d time.Duration) string {
 
 // runTUI launches the full-screen session manager and executes the chosen action.
 func runTUI(cwd string) error {
-	sessions, _ := tmux.ListSessions()
+	sessions, _ := session.ListSessions()
 	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].LastActive.After(sessions[j].LastActive)
+		return sessions[i].CreatedAt.After(sessions[j].CreatedAt)
 	})
 	reg, _ := project.Load()
 
@@ -253,8 +256,7 @@ func runTUI(cwd string) error {
 	base := filepath.Base(cwd)
 	name := base
 	for i := 2; ; i++ {
-		exists, err := tmux.SessionExists(name)
-		if err != nil || !exists {
+		if !session.SessionExists(name) {
 			break
 		}
 		name = fmt.Sprintf("%s-%d", base, i)

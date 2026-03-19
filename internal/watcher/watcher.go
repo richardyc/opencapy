@@ -2,12 +2,9 @@ package watcher
 
 import (
 	"context"
-	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/richardyc/opencapy/internal/tmux"
 )
 
 // EventType classifies session events.
@@ -31,24 +28,19 @@ type Event struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// Watcher polls tmux sessions for raw terminal output (live display).
-// All semantic events (approval, done, crash, running) come from Claude Code's
-// hook system and the JSONL transcript watcher — no string pattern matching.
+// Watcher manages session events. All events are pushed via callbacks
+// (FeedOutput for PTY data, Emit for hook events).
 type Watcher struct {
 	mu        sync.RWMutex
 	sessions  map[string]string
 	events    chan Event
-	interval  time.Duration
-	lastHash  map[string]uint64
 	lastEvent map[string]map[EventType]time.Time
 }
 
-func New(interval time.Duration) *Watcher {
+func New() *Watcher {
 	return &Watcher{
 		sessions:  make(map[string]string),
 		events:    make(chan Event, 100),
-		interval:  interval,
-		lastHash:  make(map[string]uint64),
 		lastEvent: make(map[string]map[EventType]time.Time),
 	}
 }
@@ -70,7 +62,6 @@ func (w *Watcher) RemoveSession(name string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.sessions, name)
-	delete(w.lastHash, name)
 	delete(w.lastEvent, name)
 }
 
@@ -78,56 +69,9 @@ func (w *Watcher) Events() <-chan Event {
 	return w.events
 }
 
-// Start begins the poll loop. Blocks until ctx is cancelled.
+// Start blocks until ctx is cancelled.
 func (w *Watcher) Start(ctx context.Context) {
-	ticker := time.NewTicker(w.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			w.poll()
-		}
-	}
-}
-
-func (w *Watcher) poll() {
-	w.mu.RLock()
-	names := make([]string, 0, len(w.sessions))
-	for name := range w.sessions {
-		names = append(names, name)
-	}
-	w.mu.RUnlock()
-
-	for _, name := range names {
-		output, err := tmux.CapturePaneOutput(name, 20, true)
-		if err != nil {
-			continue
-		}
-
-		h := fnv.New64a()
-		h.Write([]byte(output))
-		hash := h.Sum64()
-		w.mu.Lock()
-		if w.lastHash[name] == hash {
-			w.mu.Unlock()
-			continue
-		}
-		w.lastHash[name] = hash
-		w.mu.Unlock()
-
-		lines := strings.Split(output, "\n")
-		if len(lines) > 15 {
-			lines = lines[len(lines)-15:]
-		}
-		w.tryEmit(name, Event{
-			Type:      EventOutput,
-			Session:   name,
-			Content:   strings.Join(lines, "\n"),
-			Timestamp: time.Now(),
-		}, 1*time.Second)
-	}
+	<-ctx.Done()
 }
 
 // Emit sends an event directly, bypassing cooldown.
@@ -139,7 +83,7 @@ func (w *Watcher) Emit(ev Event) {
 	}
 }
 
-// FeedOutput emits raw terminal output for a direct session.
+// FeedOutput emits raw terminal output for a session.
 func (w *Watcher) FeedOutput(sessionName, output string) {
 	if output == "" {
 		return

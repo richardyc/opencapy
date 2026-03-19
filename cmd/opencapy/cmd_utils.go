@@ -19,7 +19,7 @@ import (
 	"github.com/richardyc/opencapy/internal/config"
 	"github.com/richardyc/opencapy/internal/platform"
 	"github.com/richardyc/opencapy/internal/relay"
-	"github.com/richardyc/opencapy/internal/tmux"
+	"github.com/richardyc/opencapy/internal/session"
 	"github.com/spf13/cobra"
 )
 
@@ -42,8 +42,8 @@ func newStatusCmd() *cobra.Command {
 			conn.Close()
 			fmt.Printf("Daemon:   RUNNING (port %s)\n", port)
 			fmt.Printf("Host:     %s\n", platform.Hostname())
-			if sessions, err := tmux.ListSessions(); err == nil && len(sessions) > 0 {
-				fmt.Printf("tmux:     %d session(s)\n", len(sessions))
+			if sessions, err := session.ListSessions(); err == nil && len(sessions) > 0 {
+				fmt.Printf("Sessions: %d\n", len(sessions))
 			}
 			return nil
 		},
@@ -333,9 +333,9 @@ func newInstallCmd() *cobra.Command {
 	}
 }
 
-// patchVSCodeTabTitle adds terminal.integrated.tabs.title = "${sequence}" to
-// VS Code / Cursor settings.json if either editor is detected. Skips silently
-// if no editor is found or the file can't be parsed (e.g. JSONC with comments).
+// patchVSCodeSettings patches VS Code / Cursor settings.json with opencapy-
+// required settings. Skips silently if no editor is found or the file can't
+// be parsed (e.g. JSONC with comments, which prints a manual tip instead).
 func patchVSCodeTabTitle() {
 	home, _ := os.UserHomeDir()
 	var candidates []string
@@ -355,8 +355,11 @@ func patchVSCodeTabTitle() {
 		}
 	}
 
-	const key = "terminal.integrated.tabs.title"
-	const val = "${sequence}"
+	// Settings to apply.
+	patches := map[string]interface{}{
+		// Use OSC title sequences (set by opencapy) for tab labels.
+		"terminal.integrated.tabs.title": "${sequence}",
+	}
 	patched := false
 
 	for _, path := range candidates {
@@ -367,17 +370,32 @@ func patchVSCodeTabTitle() {
 		var settings map[string]interface{}
 		if err := json.Unmarshal(data, &settings); err != nil {
 			// JSONC with comments — can't safely patch; print manual tip instead
-			fmt.Printf("\n  %s detected — add to settings.json manually:\n", filepath.Base(filepath.Dir(filepath.Dir(path))))
-			fmt.Printf(`    "%s": "%s"`+"\n", key, val)
+			editor := filepath.Base(filepath.Dir(filepath.Dir(path)))
+			fmt.Printf("\n  %s detected — add to settings.json manually:\n", editor)
+			for k, v := range patches {
+				switch v := v.(type) {
+				case string:
+					fmt.Printf(`    "%s": "%s"`+"\n", k, v)
+				default:
+					fmt.Printf(`    "%s": %v`+"\n", k, v)
+				}
+			}
 			patched = true
 			continue
 		}
-		if v, ok := settings[key]; ok && v == val {
-			fmt.Printf("✓ %s tab titles already configured\n", filepath.Base(filepath.Dir(filepath.Dir(path))))
+		changed := false
+		for k, v := range patches {
+			if settings[k] != v {
+				settings[k] = v
+				changed = true
+			}
+		}
+		if !changed {
+			editor := filepath.Base(filepath.Dir(filepath.Dir(path)))
+			fmt.Printf("✓ %s settings already configured\n", editor)
 			patched = true
 			continue
 		}
-		settings[key] = val
 		out, err := json.MarshalIndent(settings, "", "    ")
 		if err != nil {
 			continue
@@ -386,15 +404,16 @@ func patchVSCodeTabTitle() {
 			fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", path, err)
 			continue
 		}
-		fmt.Printf("✓ %s tab titles configured for accurate session names\n", filepath.Base(filepath.Dir(filepath.Dir(path))))
+		editor := filepath.Base(filepath.Dir(filepath.Dir(path)))
+		fmt.Printf("✓ %s configured (tab titles + scrollback)\n", editor)
 		patched = true
 	}
 
 	if !patched {
-		// No editor detected — print the tip for future reference
 		fmt.Println()
-		fmt.Println("VS Code/Cursor: add to settings.json for accurate tab titles:")
-		fmt.Printf(`  "%s": "%s"`+"\n", key, val)
+		fmt.Println("VS Code/Cursor: add to settings.json for best experience:")
+		fmt.Println(`  "terminal.integrated.tabs.title": "${sequence}"`)
+		fmt.Println(`  "terminal.integrated.scrollback": 50000`)
 	}
 }
 
